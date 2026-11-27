@@ -67,3 +67,130 @@ def test_linker_clusters_by_shared_hash():
     assert res["clusters"][0]["shared_entity_types"] == ["CNP"]
     assert res["unlinked_doc_ids"] == ["d3"]
     assert cnp not in str(res)
+
+
+def test_unlabeled_full_names_and_ocr_capital_i():
+    words = make_words([
+        "Ionescu Maria Elena a depus cererea.",
+        "NICHIFOR ANTONIU",
+        "Subsemnata lonescu Maria, CNP lipsa",          # OCR read the capital I as l
+        "Furnizor: SC Energie Verde SRL",
+        "domiciliat in Str. Florilor nr. 3, Mun. Iasi",
+        "Domnule Director, va rog",
+    ])
+    ents = PIIDetector(use_spacy=False).detect(words)
+    names = {e.value for e in ents if e.type == "PERSON_NAME"}
+    assert "Ionescu Maria Elena" in names
+    assert "NICHIFOR ANTONIU" in names
+    assert any(v.startswith("Ionescu Maria") for v in names if v != "Ionescu Maria Elena")   # 'l' fixed to 'I'
+    flat = " ".join(names)
+    assert "Energie" not in flat and "Florilor" not in flat and "Director" not in flat and "Iasi" not in flat
+
+
+def test_romanian_id_card_fields():
+    first12 = "182031335597"
+    cnp = first12 + cnp_control_digit(first12)
+    words = make_words([
+        "ROMANIA ROUMANIE ROMANIA",
+        "CARTE DE IDENTITATE / IDENTITY CARD",
+        f"SERIA TM NR 632084 CNP {cnp}",
+        "Nume/Nom/Last name",
+        "DINU",
+        "Prenume/Prenom/First name",
+        "NICHIFOR ANTONIU",
+        "Loc nastere/Lieu de naissance/Place of birth",
+        "Jud. TM Mun. Timisoara",
+        "Domiciliu/Adresse/Address",
+        "Str. Lalelelor nr. 10, bl. E2, ap. 24",
+        "Emisa de/Delivree par/Issued by SPCLEP Timis",
+        "Valabilitate/Validite/Validity 20.05.2023-20.05.2033",
+        "IDROUDINU<<NICHIFOR<ANTONIU<<<<<<<<<",
+        f"TM632084<4ROU820313M3205238{cnp[7:]}<<<",
+    ])
+    ents = PIIDetector(use_spacy=False).detect(words)
+    by_type: dict[str, list[str]] = {}
+    for e in ents:
+        by_type.setdefault(e.type, []).append(e.value)
+    assert cnp in by_type["CNP"]
+    assert "TM632084" in by_type["ID_SERIES"]
+    assert "DINU" in by_type["PERSON_NAME"] and "NICHIFOR ANTONIU" in by_type["PERSON_NAME"]
+    assert any("Lalelelor" in v for v in by_type["ADDRESS"])
+    assert any("SPCLEP Timis" in v for v in by_type["ISSUER"])
+    assert "20.05.2023-20.05.2033" in by_type["ID_DATE"]
+    assert any("Timisoara" in v for v in by_type["BIRTH_PLACE"])
+    assert len(by_type["MRZ"]) == 2
+
+
+def test_issuer_and_validity_only_on_id_documents():
+    words = make_words(["FACTURA FISCALA Nr. EV-1234 Data emiterii: 05.04.2024",
+                        "Valabilitate oferta 01.01.2024-31.01.2024"])
+    types = {e.type for e in PIIDetector(use_spacy=False).detect(words)}
+    assert "ID_DATE" not in types and "ISSUER" not in types
+
+
+def test_portrait_box_on_id_card_layout():
+    from server.pii_detector import portrait_boxes
+    from server.vault import Page
+    lines = ["CARTE DE IDENTITATE", "Nume/Nom/Last name", "DINU", "Prenume/Prenom/First name", "ANA",
+             "Domiciliu/Adresse/Address", "Str. Lalelelor nr. 10", "IDROUDINU<<ANA<<<<<<<<<<<<<<"]
+    words = []
+    for li, line in enumerate(lines):
+        x = 20 if li in (0, len(lines) - 1) else 520           # labels start right of the photo
+        for tok in line.split():
+            words.append(Word(tok, x, 20 + li * 60, 14 * len(tok), 30, 95.0, 1, (1, 1, 1, li)))
+            x += 14 * len(tok) + 14
+    page = Page(1, "missing.png", 1500, 520)
+    boxes = portrait_boxes(words, [page])
+    assert len(boxes) == 1
+    _, x, y, w, h = boxes[0]
+    assert x < 100 and x + w < 520 and h > 200
+    # a plain form (text starts at the left margin) gets no portrait box
+    assert portrait_boxes(make_words(["CARTE DE IDENTITATE seria", "Subsemnatul Pop Ion"]), [page]) == []
+
+
+def test_redacted_id_card_labels_alone_are_not_pii():
+    """After redaction only the field labels remain; a label must never be read as the next field's value."""
+    words = make_words([
+        "ROMANIA CARTE DE IDENTITATE / IDENTITY CARD",
+        "SERIA CNP",
+        "Nume/Nom/Last name",
+        "Prenume/Prenom/First name",
+        "Loc nastere/Lieu de naissance/Place of birth",
+        "Domiciliu/Adresse/Address",
+        "Emisa de/Delivree par/Issued by",
+        "Valabilitate/Validite/Validity",
+        "Cetatenie/Nationalite/Nationality",
+        "Romana / ROU",
+    ])
+    assert PIIDetector(use_spacy=False).detect(words) == []
+
+
+def test_electronic_id_card_2021_layout_with_ocr_junk():
+    """New CEI front: multi-column labels, values on the next line, spaced dates, 2+7 document number,
+    a specimen CNP with a wrong checksum, and the OCR junk seen on a real scan."""
+    words = make_words([
+        "| | | | [ROMANIA __CARTEDE",
+        "| IDENTITY CARD | |",
+        "| Nume /Surmame | AR |",
+        ">>: @) MANOLE A",
+        "N Prenume /G/ven names",
+        "| CORINA",
+        "IOANA",
+        ", 4 Sex / Sex Cetatenie Data nasterii {Date of birth",
+        "| F ROU 03 07 1983",
+        "| | CNP PIN",
+        r" j 2830703460094",
+        "| . Nr. document / Document no. Data expirarii / Date of expiry",
+        "—- 1 (4)SP1236343 (5) 06 04 2035",
+        ". ( Semnatura titularului / Hofder's 6 )Q 1 3 [A 7 9",
+    ])
+    by_type: dict[str, list[str]] = {}
+    for e in PIIDetector(use_spacy=False).detect(words):
+        by_type.setdefault(e.type, []).append(e.value)
+    assert "MANOLE" in by_type["PERSON_NAME"] and "CORINA IOANA" in by_type["PERSON_NAME"]
+    assert "2830703460094" in by_type["CNP"]                  # redacted even though the checksum fails
+    assert "SP1236343" in by_type["ID_SERIES"]
+    assert "03 07 1983" in by_type["BIRTH_DATE"]
+    assert "06 04 2035" in by_type["ID_DATE"]
+    assert by_type.get("CAN")                                  # card access number next to the signature label
+    assert "ROU" not in " ".join(v for vs in by_type.values() for v in vs)

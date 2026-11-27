@@ -79,7 +79,7 @@
       <div class="drop-inner">
         <div class="drop-icon mono">[ ↓ ]</div>
         <div class="mono drop-title" id="dropTitle">DROP FILES TO REDACT</div>
-        <div class="desc">PDF · PNG · JPG — or click to browse. Sensitive data is blacked out automatically.</div>
+        <div class="desc">PDF · PNG · JPG — or click to browse. Sensitive data is blurred automatically.</div>
       </div>
       <div class="laser"></div>
     </label>
@@ -107,6 +107,13 @@
         <button data-mode="blurred" class="active">BLURRED</button>
         <button data-mode="split">SIDE-BY-SIDE</button>
       </div>
+      <div class="zoom mono" title="Wheel to zoom · drag to pan · double-click to fit">
+        <button id="zoomOut" class="btn btn-ghost btn-sm" title="Zoom out (-)">−</button>
+        <span id="zoomVal" class="zoom-val">100%</span>
+        <button id="zoomIn" class="btn btn-ghost btn-sm" title="Zoom in (+)">+</button>
+        <button id="zoomFit" class="btn btn-ghost btn-sm" title="Fit to window (0)">FIT</button>
+        <button id="zoom100" class="btn btn-ghost btn-sm" title="Actual pixels (1)">1:1</button>
+      </div>
       <div id="pager" class="pager mono hidden">
         <button id="pagePrev" class="btn btn-ghost btn-sm">‹</button>
         <span id="pageLabel">1/1</span>
@@ -115,8 +122,8 @@
       <button id="previewClose" class="btn btn-ghost btn-sm" title="Close (Esc)">✕</button>
     </div>
     <div id="previewBody" class="modal-body mode-blurred">
-      <figure class="pane pane-original"><figcaption class="mono">ORIGINAL</figcaption><img id="imgOriginal" alt="Original document"></figure>
-      <figure class="pane pane-blurred"><figcaption class="mono">BLURRED</figcaption><img id="imgBlurred" alt="Redacted document"></figure>
+      <figure class="pane pane-original"><figcaption class="mono">ORIGINAL</figcaption><img id="imgOriginal" alt="Original document" draggable="false"></figure>
+      <figure class="pane pane-blurred"><figcaption class="mono">BLURRED</figcaption><img id="imgBlurred" alt="Redacted document" draggable="false"></figure>
     </div>
   </div>
 </div>

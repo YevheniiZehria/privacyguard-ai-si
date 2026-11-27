@@ -188,7 +188,7 @@ body::after {
 .doc-table tbody tr:hover { background: #111; }
 .col-size { width: 90px; }
 .col-status { width: 190px; }
-.col-actions { width: 250px; }
+.col-actions { width: 320px; }
 .doc-name { font: 500 13px var(--mono); max-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%; }
 .doc-size { font: 11.5px var(--mono); color: var(--muted); white-space: nowrap; }
 .doc-actions { display: flex; gap: 4px; justify-content: flex-end; }
@@ -212,10 +212,12 @@ body::after {
   background: rgba(0, 0, 0, .86); animation: view-in .2s var(--ease);
 }
 .modal-box {
-  width: min(1280px, 100%); height: min(860px, 100%); display: flex; flex-direction: column;
-  background: var(--surface); border: 1px solid var(--text);
+  width: min(1400px, 100%); max-height: 100%; display: flex; flex-direction: column;
+  background: var(--surface); border: 1px solid var(--text); min-height: 0;
 }
-.modal-head { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.modal-head { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); flex-wrap: wrap; flex: none; }
+.zoom { display: flex; align-items: center; gap: 4px; }
+.zoom-val { width: 48px; text-align: center; font-size: 11px; color: var(--muted); }
 .modal-head .truncate { font-size: 13px; font-weight: 600; max-width: 40%; }
 .seg { display: inline-flex; border: 1px solid var(--line-2); }
 .seg button { padding: 5px 12px; font: 700 10.5px var(--mono); letter-spacing: .08em; color: var(--muted); }
@@ -223,17 +225,30 @@ body::after {
 .seg button:hover { color: var(--text); }
 .seg button.active { background: var(--text); color: var(--bg); }
 .pager { display: flex; align-items: center; gap: 6px; font-size: 11.5px; }
-.modal-body { flex: 1; min-height: 0; display: grid; gap: 1px; background: var(--line); }
-.modal-body.mode-split { grid-template-columns: 1fr 1fr; }
+/* the body never grows past the modal: panes clip, the image is positioned by JS (fit / zoom / pan) */
+.modal-body {
+  flex: 1 1 auto; height: 80vh; min-height: 0; display: grid; grid-template-rows: minmax(0, 1fr); gap: 1px;
+  background: var(--line); overflow: hidden;
+}
+.modal-body.mode-split { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
 .modal-body.mode-original .pane-blurred, .modal-body.mode-blurred .pane-original { display: none; }
-.pane { position: relative; display: grid; place-items: center; overflow: auto; padding: 36px 20px 20px; background: var(--bg); }
-.pane img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; border: 1px solid var(--line); background: #fff; }
+.pane {
+  position: relative; min-width: 0; min-height: 0; overflow: hidden; background: var(--bg);
+  cursor: grab; touch-action: none; user-select: none;
+}
+.pane.panning { cursor: grabbing; }
+/* fallback before JS sizing: fit inside the pane */
+.pane img {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  max-width: 100%; max-height: 80vh; object-fit: contain; display: block; background: #fff; outline: 1px solid var(--line);
+}
+.pane img.sized { left: 0; top: 0; max-width: none; max-height: none; transform-origin: 0 0; will-change: transform; }
 .pane figcaption {
-  position: absolute; top: 10px; left: 12px; font-size: 10px; letter-spacing: .14em; color: var(--muted);
-  border: 1px solid var(--line-2); padding: 1px 6px;
+  position: absolute; top: 10px; left: 12px; z-index: 2; font-size: 10px; letter-spacing: .14em; color: var(--muted);
+  border: 1px solid var(--line-2); padding: 1px 6px; background: var(--bg); pointer-events: none;
 }
 .pane-blurred figcaption { color: var(--bg); background: var(--text); border-color: var(--text); }
-.pane .no-img { font: 12px var(--mono); color: var(--muted); }
+.pane .no-img { position: absolute; inset: 0; display: grid; place-items: center; font: 12px var(--mono); color: var(--muted); }
 
 /* ---------- toast ---------- */
 .toast {
@@ -248,7 +263,7 @@ body::after {
   .col-size, .doc-table td:nth-child(2) { display: none; }
   .col-actions { width: auto; }
   .topbar { padding: 0 14px; }
-  .modal-body.mode-split { grid-template-columns: 1fr; }
+  .modal-body.mode-split { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition: none !important; }

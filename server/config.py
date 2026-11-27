@@ -18,6 +18,7 @@ def _env(name: str, default: str = "") -> str:
 TESSERACT_CMD = _env("TESSERACT_CMD")
 OCR_LANGS = _env("OCR_LANGS", "ron+eng")
 VAULT_SECRET_HEX = _env("VAULT_SECRET")
+REDACTION_MODE = _env("REDACTION_MODE", "blur").lower()     # blur | black
 OUTPUT_DIR = Path(_env("OUTPUT_DIR", str(PROJECT_ROOT / "output")))
 WORK_DIR = OUTPUT_DIR / "work"
 

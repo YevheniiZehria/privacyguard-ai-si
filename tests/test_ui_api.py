@@ -133,6 +133,11 @@ def test_upload_redacts_automatically(client):
     hub = client.get("/api/folders").json()["folders"][0]
     assert hub["document_count"] == 2 and hub["blurred_count"] == 2
 
+    rescan = client.post(f"/api/folders/{fid}/documents/{did}/rescan")
+    assert rescan.status_code == 200 and rescan.json()["status"] == "QUEUED"
+    again = next(d for d in _wait_idle(client, fid) if d["doc_id"] == did)
+    assert again["status"] == "BLURRED" and again["boxes_drawn"] >= 1
+
     assert client.delete(f"/api/folders/{fid}/documents/{did}").status_code == 200
     assert len(client.get(f"/api/folders/{fid}/documents").json()["documents"]) == 1
 

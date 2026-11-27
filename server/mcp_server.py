@@ -146,7 +146,7 @@ def redact_image(
     detection_id: Annotated[str, Field(description="detection_id returned by detect_pii")],
     padding_px: Annotated[int, Field(ge=0, le=50, description="Extra pixels around each box")] = 4,
 ) -> RedactionResult:
-    """Draw solid black boxes over every detected PII region and save output/redacted_<doc_id>.png."""
+    """Irreversibly blur every detected PII region (or black-box it with REDACTION_MODE=black) and save output/redacted_<doc_id>.png."""
     return RedactionResult(**_safe("redact_image", pipeline.redact_image, doc_id, detection_id, padding_px))
 
 

@@ -1,18 +1,55 @@
-"""Irreversible redaction: solid black filled rectangles drawn on the page images."""
+"""Irreversible redaction of PII regions on the page images.
+
+Default mode "blur": every region is destroyed in three steps so the text cannot be read or reconstructed:
+  1. random noise is mixed into the region (defeats de-pixelation attacks that brute-force known fonts),
+  2. coarse pixelation (block = ~half the region height, so one block spans several glyph strokes),
+  3. a wide Gaussian blur over the pixelated region.
+Mode "black" (REDACTION_MODE=black in .env, or mode="black") draws solid black rectangles as before.
+Both modes keep the output path / return values the pipeline expects.
+"""
 from __future__ import annotations
 
 from pathlib import Path
 
 import cv2
+import numpy as np
 
+from server import config
 from server.image_preprocessing import load_bgr, save_png
 from server.vault import Page
 
+DEFAULT_MODE = config.REDACTION_MODE
+
+
+def _odd(n: int) -> int:
+    return n if n % 2 else n + 1
+
+
+def blur_region(img: np.ndarray, x0: int, y0: int, x1: int, y1: int, rng: np.random.Generator) -> None:
+    """Noise + pixelate + Gaussian-blur img[y0:y1, x0:x1] in place."""
+    roi = img[y0:y1, x0:x1]
+    h, w = roi.shape[:2]
+    if h < 2 or w < 2:
+        img[y0:y1, x0:x1] = 0
+        return
+    noise = rng.integers(-60, 61, size=roi.shape, dtype=np.int16)
+    noisy = np.clip(roi.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    block = max(8, h // 2)
+    small = cv2.resize(noisy, (max(1, w // block), max(1, h // block)), interpolation=cv2.INTER_AREA)
+    pix = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
+    # kernel wider than a block so no block edges survive (sharp edges are what OCR hallucinates glyphs from)
+    k = _odd(max(15, block * 3))
+    img[y0:y1, x0:x1] = cv2.GaussianBlur(pix, (k, k), 0, borderType=cv2.BORDER_REPLICATE)
+
 
 def redact_pages(pages: list[Page], boxes: list[tuple[int, int, int, int, int]], doc_id: str,
-                 output_dir: Path, padding_px: int = 4) -> tuple[list[str], int]:
-    """Draw (0,0,0) filled boxes. Returns (output paths, boxes drawn)."""
+                 output_dir: Path, padding_px: int = 4, mode: str | None = None) -> tuple[list[str], int]:
+    """Redact every box on its page. Returns (output paths, boxes redacted)."""
+    mode = (mode or DEFAULT_MODE).lower()
+    if mode not in ("blur", "black"):
+        raise ValueError("mode must be 'blur' or 'black'")
     output_dir.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng()
     paths: list[str] = []
     drawn = 0
     for page in pages:
@@ -22,8 +59,13 @@ def redact_pages(pages: list[Page], boxes: list[tuple[int, int, int, int, int]],
             if pg != page.number:
                 continue
             x0, y0 = max(0, x - padding_px), max(0, y - padding_px)
-            x1, y1 = min(w - 1, x + bw + padding_px), min(h - 1, y + bh + padding_px)
-            cv2.rectangle(img, (x0, y0), (x1, y1), (0, 0, 0), thickness=-1)
+            x1, y1 = min(w, x + bw + padding_px + 1), min(h, y + bh + padding_px + 1)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            if mode == "black":
+                cv2.rectangle(img, (x0, y0), (x1 - 1, y1 - 1), (0, 0, 0), thickness=-1)
+            else:
+                blur_region(img, x0, y0, x1, y1, rng)
             drawn += 1
         suffix = "" if page.number == 1 else f"_p{page.number}"
         out = output_dir / f"redacted_{doc_id}{suffix}.png"

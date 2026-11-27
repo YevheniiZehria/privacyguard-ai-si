@@ -11,7 +11,8 @@ from server import config
 from server.entity_linker import EntityLinker, entity_hashes
 from server.ocr_engine import ocr_file, ocr_image
 from server.image_preprocessing import load_bgr
-from server.pii_detector import PIIDetector, build_lines, entity_boxes, strip_diacritics, summarize
+from server.pii_detector import (PIIDetector, build_lines, entity_boxes, portrait_boxes, strip_diacritics,
+                                 summarize)
 from server.redactor import redact_pages
 from server.vault import DetectionRecord, DocumentRecord, RedactionRecord, Vault
 
@@ -47,11 +48,16 @@ class PrivacyPipeline:
         entities = self.detector.detect(doc.words, use_local_slm=use_local_slm,
                                         slm_base_url=config.LOCAL_SLM_BASE_URL, slm_model=config.LOCAL_SLM_MODEL)
         boxes = entity_boxes(entities, doc.words)
+        portraits = portrait_boxes(doc.words, doc.pages)          # ID-card photo (no text, so not an entity)
+        boxes += portraits
         hashes = entity_hashes(entities, self.vault.hmac_hex)
         det = DetectionRecord(self.vault.new_id("det"), doc_id, entities, boxes, hashes)
         self.vault.put_detection(det)
         self.linker.update_document(doc_id, hashes)
-        return {"detection_id": det.detection_id, "doc_id": doc_id, "summary": summarize(entities),
+        summary = summarize(entities)
+        if portraits:
+            summary["PORTRAIT"] = len(portraits)
+        return {"detection_id": det.detection_id, "doc_id": doc_id, "summary": summary,
                 "total_boxes": len(boxes), "linkable_identifiers": sum(len(v) for v in hashes.values())}
 
     # 3 ----------------------------------------------------------------------

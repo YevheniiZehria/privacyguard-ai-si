@@ -131,9 +131,13 @@ def main() -> None:
         p = tp_det[t] / n_det[t] if n_det[t] else 0.0
         r = tp_gt[t] / n_gt[t] if n_gt[t] else 0.0
         rows.append([t, n_gt[t], n_det[t], f"{p:.3f}", f"{r:.3f}", f"{f1(p, r):.3f}"])
-    P = sum(tp_det.values()) / max(sum(n_det.values()), 1)
+    # micro totals only over the types the ground truth labels; extra ID-card fields (issuer, validity, place of
+    # birth, portrait) are redacted too but have no ground truth, so they are listed separately and not scored
+    scored_det = sum(n_det[t] for t in TYPES)
+    P = sum(tp_det[t] for t in TYPES) / max(scored_det, 1)
     R = sum(tp_gt.values()) / max(sum(n_gt.values()), 1)
-    rows.append(["**ALL (micro)**", sum(n_gt.values()), sum(n_det.values()), f"{P:.3f}", f"{R:.3f}", f"{f1(P, R):.3f}"])
+    rows.append(["**ALL (micro)**", sum(n_gt.values()), scored_det, f"{P:.3f}", f"{R:.3f}", f"{f1(P, R):.3f}"])
+    extra = {t: n for t, n in sorted(n_det.items()) if t not in TYPES and n}
 
     passes = sum(1 for d in per_doc if d[9] == "PASS")
     clusters_desc = [f"{c['cluster_id']}: {len(c['doc_ids'])} docs, persons "
@@ -151,6 +155,8 @@ def main() -> None:
         f"Dataset: {len(gt)} synthetic documents ({len(set(doc_person.values()))} fictional people). "
         f"Total runtime {time.time() - t0:.0f}s.", "",
         "## PII detection", det_tbl, "",
+        *([f"Also redacted (not in ground truth, not scored): "
+           + ", ".join(f"{k} {v}" for k, v in extra.items()), ""] if extra else []),
         "## Redaction", f"* Ground-truth PII values still readable after redaction: **{leaks_total} / {gt_total}** "
         f"(redaction recall {1 - leaks_total / max(gt_total, 1):.3f})",
         f"* verify_redaction PASS: **{passes} / {len(per_doc)}**", "",

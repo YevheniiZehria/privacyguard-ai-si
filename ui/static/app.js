@@ -251,6 +251,7 @@ function renderDocs() {
       <td><div class="doc-actions">
         <button class="link-act" data-act="preview">PREVIEW</button>
         <a class="link-act ${finished ? '' : 'disabled'}" href="${finished ? `${docUrl(d)}/download` : '#'}" data-act="download">DOWNLOAD</a>
+        <button class="link-act ${ACTIVE.includes(d.status) ? 'disabled' : ''}" data-act="rescan" title="Run detection and redaction again">RESCAN</button>
         <button class="link-act danger" data-act="delete" title="Remove document">✕</button>
       </div></td>
     </tr>`;
@@ -277,6 +278,10 @@ async function onDocAction(e) {
   const doc = S.docs.find((d) => d.doc_id === btn.closest('tr').dataset.id);
   if (!doc) return;
   if (btn.dataset.act === 'preview') openPreview(doc);
+  if (btn.dataset.act === 'rescan') {
+    try { await api(`${docUrl(doc)}/rescan`, { method: 'POST' }); toast(`rescanning ${doc.name}`); stopPolling(); refreshFolder(); }
+    catch (ex) { toast(ex.message, true); }
+  }
   if (btn.dataset.act === 'delete') {
     if (!confirm(`Remove "${doc.name}" and its redacted output?`)) return;
     try { await api(docUrl(doc), { method: 'DELETE' }); stopPolling(); refreshFolder(); } catch (ex) { toast(ex.message, true); }
@@ -286,7 +291,8 @@ async function onDocAction(e) {
 // ------------------------------------------------------------------ preview
 function openPreview(doc) {
   const finished = FINISHED.includes(doc.status);
-  S.preview = { doc, page: 1, pages: doc.page_count || 1, mode: finished ? 'split' : 'original' };
+  S.preview = { doc, page: 1, pages: doc.page_count || 1, mode: finished ? 'split' : 'original',
+    tf: null, size: null };
   $('#previewTitle').textContent = doc.name;
   $('#preview').classList.remove('hidden');
   renderPreview();
@@ -304,17 +310,91 @@ function renderPreview() {
   $('#pager').classList.toggle('hidden', p.pages < 2);
   $('#pageLabel').textContent = `${p.page}/${p.pages}`;
   const v = p.doc.processed || p.doc.created;
+  p.tf = null; p.size = null;                       // new page -> fit again once it has loaded
   for (const [id, kind] of [['#imgOriginal', 'original'], ['#imgBlurred', 'blurred']]) {
     const img = $(id);
     const pane = img.parentElement;
     pane.querySelector('.no-img')?.remove();
-    img.classList.remove('hidden');
+    img.classList.remove('hidden', 'sized');
+    img.style.transform = '';
+    img.onload = () => {
+      if (!S.preview) return;
+      if (!p.size) p.size = { w: img.naturalWidth, h: img.naturalHeight };
+      if (!p.tf) fitPreview(); else applyPreviewTransform();
+    };
     img.onerror = () => {
       img.classList.add('hidden');
       if (!pane.querySelector('.no-img')) pane.insertAdjacentHTML('beforeend', `<span class="no-img">// ${kind} not available${kind === 'original' && !finished ? ' until the scan finishes' : ''}</span>`);
     };
     img.src = `${docUrl(p.doc)}/image/${kind}?page=${p.page}&v=${v}`;
   }
+}
+// Both panes share one transform, so the original and redacted page stay aligned while zooming / panning.
+function previewPane() {
+  return [...$$('#previewBody .pane')].find((el) => el.offsetParent !== null) || $('#previewBody .pane');
+}
+function fitPreview() {
+  const p = S.preview;
+  if (!p || !p.size) return;
+  const pane = previewPane();
+  const pw = pane.clientWidth, ph = pane.clientHeight, m = 24;
+  const scale = Math.min((pw - 2 * m) / p.size.w, (ph - 2 * m) / p.size.h, 1);   // never upscale on fit
+  p.tf = { scale, x: (pw - p.size.w * scale) / 2, y: (ph - p.size.h * scale) / 2, fit: true };
+  applyPreviewTransform();
+}
+function applyPreviewTransform() {
+  const p = S.preview;
+  if (!p || !p.tf) return;
+  const { scale, x, y } = p.tf;
+  for (const img of [$('#imgOriginal'), $('#imgBlurred')]) {
+    if (!img.naturalWidth) continue;
+    img.classList.add('sized');
+    img.style.width = `${p.size.w}px`; img.style.height = `${p.size.h}px`;
+    img.style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
+  }
+  $('#zoomVal').textContent = `${Math.round(scale * 100)}%`;
+}
+function zoomPreview(factor, cx, cy) {
+  const p = S.preview;
+  if (!p || !p.tf) return;
+  const pane = previewPane();
+  if (cx === undefined) { cx = pane.clientWidth / 2; cy = pane.clientHeight / 2; }
+  const t = p.tf;
+  const ns = Math.min(8, Math.max(0.05, t.scale * factor));
+  const k = ns / t.scale;
+  p.tf = { scale: ns, x: cx - (cx - t.x) * k, y: cy - (cy - t.y) * k, fit: false };
+  applyPreviewTransform();
+}
+function setupPreviewZoom() {
+  let drag = null;
+  for (const pane of $$('#previewBody .pane')) {
+    pane.addEventListener('wheel', (e) => {
+      if (!S.preview || !S.preview.tf) return;
+      e.preventDefault();
+      const r = pane.getBoundingClientRect();
+      zoomPreview(e.deltaY < 0 ? 1.15 : 1 / 1.15, e.clientX - r.left, e.clientY - r.top);
+    }, { passive: false });
+    pane.addEventListener('pointerdown', (e) => {
+      if (!S.preview || !S.preview.tf) return;
+      drag = { pane, x: e.clientX, y: e.clientY, tx: S.preview.tf.x, ty: S.preview.tf.y };
+      pane.setPointerCapture(e.pointerId);
+      pane.classList.add('panning');
+    });
+    pane.addEventListener('pointermove', (e) => {
+      if (!drag || drag.pane !== pane || !S.preview) return;
+      S.preview.tf = { ...S.preview.tf, x: drag.tx + e.clientX - drag.x, y: drag.ty + e.clientY - drag.y, fit: false };
+      applyPreviewTransform();
+    });
+    const end = () => { drag = null; pane.classList.remove('panning'); };
+    pane.addEventListener('pointerup', end);
+    pane.addEventListener('pointercancel', end);
+    pane.addEventListener('dblclick', fitPreview);
+  }
+  $('#zoomIn').onclick = () => zoomPreview(1.25);
+  $('#zoomOut').onclick = () => zoomPreview(0.8);
+  $('#zoomFit').onclick = fitPreview;
+  $('#zoom100').onclick = () => { if (S.preview && S.preview.tf) zoomPreview(1 / S.preview.tf.scale); };
+  window.addEventListener('resize', () => { if (S.preview && (!S.preview.tf || S.preview.tf.fit)) fitPreview(); });
 }
 function closePreview() {
   S.preview = null;
@@ -354,7 +434,14 @@ function bind() {
   $('#fileInput').onchange = (e) => { uploadFiles(e.target.files); e.target.value = ''; };
   $('#docRows').onclick = onDocAction;
 
-  $$('#previewSeg button').forEach((b) => b.onclick = () => { if (S.preview) { S.preview.mode = b.dataset.mode; renderPreview(); } });
+  $$('#previewSeg button').forEach((b) => b.onclick = () => {
+    if (!S.preview) return;
+    S.preview.mode = b.dataset.mode;
+    $$('#previewSeg button').forEach((x) => x.classList.toggle('active', x === b));
+    $('#previewBody').className = `modal-body mode-${S.preview.mode}`;
+    fitPreview();                                   // pane width changes between single and side-by-side
+  });
+  setupPreviewZoom();
   $('#pagePrev').onclick = () => { if (S.preview && S.preview.page > 1) { S.preview.page--; renderPreview(); } };
   $('#pageNext').onclick = () => { if (S.preview && S.preview.page < S.preview.pages) { S.preview.page++; renderPreview(); } };
   $('#previewClose').onclick = closePreview;
@@ -364,6 +451,10 @@ function bind() {
     if (e.key === 'Escape') closePreview();
     if (e.key === 'ArrowRight') $('#pageNext').click();
     if (e.key === 'ArrowLeft') $('#pagePrev').click();
+    if (e.key === '+' || e.key === '=') zoomPreview(1.25);
+    if (e.key === '-') zoomPreview(0.8);
+    if (e.key === '0') fitPreview();
+    if (e.key === '1') $('#zoom100').click();
   });
   window.addEventListener('hashchange', route);
 }

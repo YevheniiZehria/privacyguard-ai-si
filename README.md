@@ -4,7 +4,7 @@ An autonomous **CLI agent** connected to a local **MCP server** that:
 
 1. OCRs scanned Romanian documents (ID cards, application forms, invoices, PDFs) with OpenCV + Tesseract,
 2. detects PII (CNP with official checksum, names, addresses, ID series, IBAN, phone, e-mail, birth date, MRZ),
-3. redacts it with solid black boxes and **verifies** the redaction by re-running OCR,
+3. redacts it with an irreversible blur (noise + pixelation + Gaussian; `REDACTION_MODE=black` for solid boxes) and **verifies** the redaction by re-running OCR,
 4. **links documents that belong to the same person** via salted HMAC-SHA256 hashes,
 5. announces the result with **offline text-to-speech**,
 
@@ -36,7 +36,7 @@ while the LLM (cloud or local) **never receives raw document text or PII** — o
  │ server/ocr_engine.py + image_preprocessing.py + pdf_reader.py   OpenCV + Tesseract    │
  │ server/pii_detector.py   regex + checksums + label context (+ optional spaCy / SLM)   │
  │ server/entity_linker.py  HMAC-SHA256 bipartite graph (networkx) → clusters           │
- │ server/redactor.py       filled (0,0,0) rectangles → output/redacted_<doc_id>.png     │
+ │ server/redactor.py       noise+pixelate+blur regions → output/redacted_<doc_id>.png  │
  └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -92,10 +92,14 @@ lenient OCR-confusion pass after a `CNP` label; labelled `SERIA XX NR 123456` an
 context); IBAN with mod-97; Romanian phone numbers; e-mail (also when OCR reads `@` as `Q`); names after
 labels (`Nume`, `Prenume`, `Subsemnatul/a`, `Client`, `Titular`, `Semnătura`, …, including bilingual ID-card
 labels with the value on the next line); addresses after `Domiciliu`/`Adresa`/`Domiciliat în` or starting with
-`Str./Bd./Calea…`, including continuation lines; MRZ lines. Detected name tokens are propagated to other
-occurrences (signatures). Optional: spaCy `ro_core_news_sm`, local Ollama SLM.
+`Str./Bd./Calea…`, including continuation lines; MRZ lines. **Unlabeled full names** (`Ionescu Maria Elena`,
+`NICHIFOR ANTONIU`) via a lexicon of common Romanian given names + surnames / surname endings, and OCR's `I`→`l`
+slip (`lonescu`) is tolerated. On identity cards (CI / buletin) also: issuing authority (`Emisă de … SPCLEP X`),
+validity / issue dates, place of birth, next-line birth dates, and the **portrait** (text-free block left of the
+field labels; a Haar face detector is added when OpenCV ships its model file). Detected name tokens are
+propagated to other occurrences (signatures). Optional: spaCy `ro_core_news_sm`, local Ollama SLM.
 
-**Verification:** the redacted image is re-OCR'd; text hallucinated on the edges of black boxes is ignored;
+**Verification:** the redacted image is re-OCR'd; text hallucinated on or around redacted regions is ignored;
 the detector runs on the remaining visible text and every original PII value is searched for in the new text.
 Any hit → `FAIL`.
 

@@ -282,7 +282,11 @@ app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
-    return HTMLResponse((STATIC / "index.html").read_text(encoding="utf-8"), headers={"Cache-Control": "no-store"})
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    for asset in ("styles.css", "app.js"):          # cache-bust: browsers otherwise keep serving an old copy
+        version = int((STATIC / asset).stat().st_mtime)
+        html = html.replace(f"/static/{asset}\"", f"/static/{asset}?v={version}\"")
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
 
 class LoginRequest(BaseModel):
@@ -403,13 +407,31 @@ def delete_document(folder_id: str, doc_id: str) -> dict:
         meta = STORE.load(folder_id)
         meta["documents"] = [x for x in meta["documents"] if x["doc_id"] != doc_id]
         STORE.save(meta)
-        paths = [STORE.original_path(folder_id, doc), *STORE.page_paths(folder_id, doc, "original"),
-                 *STORE.page_paths(folder_id, doc, "blurred")]
-        if doc.get("pipeline_doc_id"):
-            paths += list((STORE.root / folder_id / "out" / "work").glob(f"{doc['pipeline_doc_id']}_*"))
-        for p in paths:
-            p.unlink(missing_ok=True)
+        _remove_outputs(folder_id, doc)
+        STORE.original_path(folder_id, doc).unlink(missing_ok=True)
     return {"ok": True}
+
+
+def _remove_outputs(folder_id: str, doc: dict) -> None:
+    paths = [*STORE.page_paths(folder_id, doc, "original"), *STORE.page_paths(folder_id, doc, "blurred")]
+    if doc.get("pipeline_doc_id"):
+        paths += list((STORE.root / folder_id / "out" / "work").glob(f"{doc['pipeline_doc_id']}_*"))
+    for p in paths:
+        p.unlink(missing_ok=True)
+
+
+@api.post("/folders/{folder_id}/documents/{doc_id}/rescan")
+def rescan_document(folder_id: str, doc_id: str) -> dict:
+    """Run a document through the pipeline again (e.g. after the detector improved)."""
+    with STORE.lock:
+        doc = _doc(folder_id, doc_id)
+        if doc["status"] in ACTIVE:
+            raise HTTPException(409, "Document is already being processed")
+        _remove_outputs(folder_id, doc)
+        doc = STORE.update_doc(folder_id, doc_id, status="QUEUED", pipeline_doc_id=None, page_count=None,
+                               boxes_drawn=None, residual_pii_count=None, processed=None, error=None)
+    JOBS.put((folder_id, doc_id))
+    return public_doc(doc)
 
 
 @api.get("/folders/{folder_id}/documents/{doc_id}/image/{kind}")
