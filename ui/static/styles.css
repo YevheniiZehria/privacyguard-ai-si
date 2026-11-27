@@ -237,6 +237,14 @@ body::after {
   cursor: grab; touch-action: none; user-select: none;
 }
 .pane.panning { cursor: grabbing; }
+.modal-body.drawing .pane { cursor: crosshair; }
+#manualBtn.active { background: var(--text); color: var(--bg); border-color: var(--text); }
+.draw-rect {
+  position: absolute; z-index: 3; pointer-events: none; border: 1px dashed var(--text);
+  background: rgba(255, 255, 255, .12); box-shadow: 0 0 0 1px #000;
+}
+.draw-hint { position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); z-index: 3; pointer-events: none;
+  font: 11px var(--mono); background: var(--bg); border: 1px solid var(--text); padding: 3px 8px; }
 /* fallback before JS sizing: fit inside the pane */
 .pane img {
   position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);

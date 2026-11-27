@@ -227,16 +227,45 @@ def process_document(folder_id: str, doc_id: str, pipe) -> None:
         det = pipe.detect_pii(ocr["doc_id"])
         red = pipe.redact_image(ocr["doc_id"], det["detection_id"], PADDING_PX)
         ver = pipe.verify_redaction(red["result_id"])
-        store.update_doc(folder_id, doc_id, status="BLURRED" if ver["verified"] else "REVIEW",
-                         pipeline_doc_id=ocr["doc_id"], page_count=ocr["page_count"],
-                         boxes_drawn=red["boxes_drawn"], residual_pii_count=ver["residual_pii_count"],
-                         processed=time.time())
+        doc = store.update_doc(folder_id, doc_id, status="BLURRED" if ver["verified"] else "REVIEW",
+                               pipeline_doc_id=ocr["doc_id"], page_count=ocr["page_count"],
+                               boxes_drawn=red["boxes_drawn"], residual_pii_count=ver["residual_pii_count"],
+                               processed=time.time())
+        if doc and doc.get("manual_boxes"):         # the user's manual boxes survive a rescan
+            apply_manual_boxes(folder_id, doc, doc["manual_boxes"])
     except Exception as exc:                       # pipeline errors never contain document text
         store.update_doc(folder_id, doc_id, status="ERROR", error=f"{type(exc).__name__}: {exc}"[:300])
     finally:
         pipe.vault.clear()                         # raw OCR text / PII values do not outlive the job
         if not (store.root / folder_id / "metadata.json").exists():
             shutil.rmtree(store.root / folder_id, ignore_errors=True)   # folder deleted mid-scan
+
+
+def apply_manual_boxes(folder_id: str, doc: dict, boxes: list[list[int]]) -> int:
+    """Blur user-drawn rectangles ([page, x, y, w, h] in page pixels) on the redacted pages, with exactly the
+    same irreversible blur the pipeline uses. Returns how many were applied."""
+    import numpy as np
+    from server.image_preprocessing import load_bgr, save_png
+    from server.redactor import blur_region
+    pages = STORE.page_paths(folder_id, doc, "blurred")
+    rng = np.random.default_rng()
+    applied = 0
+    by_page: dict[int, list[list[int]]] = {}
+    for b in boxes:
+        by_page.setdefault(int(b[0]), []).append(b)
+    for page_no, items in by_page.items():
+        if not 1 <= page_no <= len(pages):
+            continue
+        img = load_bgr(str(pages[page_no - 1]))
+        h, w = img.shape[:2]
+        for _, x, y, bw, bh in items:
+            x0, y0 = max(0, int(x)), max(0, int(y))
+            x1, y1 = min(w, int(x + bw)), min(h, int(y + bh))
+            if x1 - x0 >= 2 and y1 - y0 >= 2:
+                blur_region(img, x0, y0, x1, y1, rng)
+                applied += 1
+        save_png(str(pages[page_no - 1]), img)
+    return applied
 
 
 def worker_loop() -> None:
@@ -432,6 +461,40 @@ def rescan_document(folder_id: str, doc_id: str) -> dict:
                                boxes_drawn=None, residual_pii_count=None, processed=None, error=None)
     JOBS.put((folder_id, doc_id))
     return public_doc(doc)
+
+
+class ManualBox(BaseModel):
+    page: int = Field(1, ge=1)
+    x: int = Field(..., ge=0)
+    y: int = Field(..., ge=0)
+    w: int = Field(..., ge=2, le=20000)
+    h: int = Field(..., ge=2, le=20000)
+
+
+@api.post("/folders/{folder_id}/documents/{doc_id}/manual-redact")
+def manual_redact(folder_id: str, doc_id: str, box: ManualBox) -> dict:
+    """Safety net: blur a rectangle the user drew over something the detector missed (page pixels)."""
+    with STORE.lock:
+        doc = _doc(folder_id, doc_id)
+        if doc["status"] not in FINISHED or not STORE.page_paths(folder_id, doc, "blurred"):
+            raise HTTPException(409, "Document is not redacted yet")
+        if box.page > (doc.get("page_count") or 1):
+            raise HTTPException(400, "Page out of range")
+        rect = [box.page, box.x, box.y, box.w, box.h]
+        if not apply_manual_boxes(folder_id, doc, [rect]):
+            raise HTTPException(400, "Rectangle is outside the page")
+        doc = STORE.update_doc(folder_id, doc_id, manual_boxes=[*(doc.get("manual_boxes") or []), rect],
+                               processed=time.time())
+    return public_doc(doc)
+
+
+@api.delete("/folders/{folder_id}/documents/{doc_id}/manual-redact")
+def clear_manual_redactions(folder_id: str, doc_id: str) -> dict:
+    """Undo all manual boxes: they are baked into the image, so the document is simply processed again."""
+    with STORE.lock:
+        _doc(folder_id, doc_id)
+        STORE.update_doc(folder_id, doc_id, manual_boxes=[])
+    return rescan_document(folder_id, doc_id)
 
 
 @api.get("/folders/{folder_id}/documents/{doc_id}/image/{kind}")

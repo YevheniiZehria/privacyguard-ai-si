@@ -133,10 +133,22 @@ def test_upload_redacts_automatically(client):
     hub = client.get("/api/folders").json()["folders"][0]
     assert hub["document_count"] == 2 and hub["blurred_count"] == 2
 
+    # manual blur box: changes the redacted page, is stored, survives a rescan, and can be undone
+    before = client.get(f"/api/folders/{fid}/documents/{did}/image/blurred").content
+    m = client.post(f"/api/folders/{fid}/documents/{did}/manual-redact", json={"page": 1, "x": 900, "y": 150, "w": 300, "h": 80})
+    assert m.status_code == 200 and m.json()["manual_boxes"] == [[1, 900, 150, 300, 80]]
+    assert client.get(f"/api/folders/{fid}/documents/{did}/image/blurred").content != before
+    assert client.post(f"/api/folders/{fid}/documents/{did}/manual-redact",
+                       json={"page": 9, "x": 0, "y": 0, "w": 10, "h": 10}).status_code == 400
+
     rescan = client.post(f"/api/folders/{fid}/documents/{did}/rescan")
     assert rescan.status_code == 200 and rescan.json()["status"] == "QUEUED"
     again = next(d for d in _wait_idle(client, fid) if d["doc_id"] == did)
-    assert again["status"] == "BLURRED" and again["boxes_drawn"] >= 1
+    assert again["status"] == "BLURRED" and again["boxes_drawn"] >= 1 and again["manual_boxes"]
+    undo = client.delete(f"/api/folders/{fid}/documents/{did}/manual-redact")
+    assert undo.status_code == 200 and undo.json()["status"] == "QUEUED"
+    again = next(d for d in _wait_idle(client, fid) if d["doc_id"] == did)
+    assert again["manual_boxes"] == [] and again["status"] == "BLURRED"
 
     assert client.delete(f"/api/folders/{fid}/documents/{did}").status_code == 200
     assert len(client.get(f"/api/folders/{fid}/documents").json()["documents"]) == 1

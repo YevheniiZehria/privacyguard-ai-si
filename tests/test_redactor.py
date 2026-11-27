@@ -34,3 +34,10 @@ def test_black_mode_still_available(tmp_path):
     page = _page(tmp_path)
     paths, _ = redact_pages([page], [(1, 110, 30, 400, 50)], "doc_b", tmp_path / "out", mode="black")
     assert (load_bgr(paths[0])[40:70, 150:450] == 0).all()
+
+
+def test_padding_scales_with_box_and_is_capped():
+    from server.redactor import effective_padding
+    assert effective_padding(40, 4, 1500) == 10                # 25% of a 40 px text line
+    assert effective_padding(8, 4, 1500) >= 4                  # never below the minimum
+    assert effective_padding(1000, 4, 600) == 9                # big box on a small scan: capped at 1.5% of 600

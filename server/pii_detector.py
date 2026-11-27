@@ -75,18 +75,50 @@ RO_ID_SERIES = {
     "ZC", "ZH", "ZL", "ZR",
 }
 
+# --- OCR-tolerant label words -------------------------------------------------------------------------------
+# OCR misreads labels in predictable ways: m -> rn/nn ("Prenurne"), ri -> n ("Sena"), i/l -> 1/|, o -> 0,
+# dropped letters ("sera"). fz() turns a plain label word into a regex that accepts those variants. It only
+# changes what we MATCH; the OCR text and its char-offset -> word mapping are never rewritten.
+_FZ_CHARS = {"m": "(?:m|rn|nn|n)", "i": "[il1|!]?", "l": "[l1i|I]", "o": "[o0]", "a": "[aă@]", "e": "[eéc]",
+             "s": "[sșş5]", "t": "[tțţ]", "u": "[uv]", "n": "(?:n|ri)"}
+
+
+def fz(word: str) -> str:
+    """Regex for `word` that tolerates common OCR errors (the digraph 'ri' is handled first)."""
+    out, i = [], 0
+    w = word.lower()
+    while i < len(w):
+        if w.startswith("ri", i):
+            out.append("(?:ri|rl|r1|n|r)")
+            i += 2
+            continue
+        c = w[i]
+        out.append(_FZ_CHARS.get(c, re.escape(c)) if c.isalpha() else re.escape(c))
+        i += 1
+    return "".join(out)
+
+
+FZ_NUME, FZ_PRENUME = fz("nume"), fz("prenume")
+CNP_LABEL = r"\bC\.?\s?N\.?\s?P\b\.?"            # CNP, C.N.P., C N P
+
 NAME_LABELS = [
-    r"nume\s*(?:si|și|/)?\s*prenume(?:le)?", r"numele\s+si\s+prenumele", r"nume(?:le)?", r"prenume(?:le)?",
+    FZ_NUME + r"\s*(?:si|și|/)?\s*" + FZ_PRENUME + r"(?:le)?", fz("numele") + r"\s+si\s+" + fz("prenumele"),
+    FZ_NUME + r"(?:le)?", FZ_PRENUME + r"(?:le)?",
     r"subsemnat(?:ul|a)", r"titular(?:ul)?", r"client(?:ul)?", r"beneficiar(?:ul)?", r"cumparator(?:ul)?",
     r"vanzator(?:ul)?", r"locatar(?:ul)?", r"proprietar(?:ul)?", r"solicitant(?:ul)?", r"angajat(?:ul)?",
     r"domnul", r"doamna", r"dl\.?", r"dna\.?", r"last\s*name", r"first\s*name", r"nom", r"prenom",
     r"semnatura", r"reprezentant(?:ul)?", r"intocmit", r"student(?:ul|a)?",
 ]
-ADDRESS_LABELS = [r"domiciliu(?:l)?", r"domiciliat(?:a)?\s+(?:in|în)", r"adresa(?:\s+de\s+\w+)?",
+ADDRESS_LABELS = [fz("domiciliu") + r"(?:l)?", r"domiciliat(?:a)?\s+(?:in|în)", fz("adresa") + r"(?:\s+de\s+\w+)?",
                   r"adresse", r"address", r"sediul", r"resedinta", r"locul\s+consumului", r"loc\s+consum"]
 ADDRESS_START = r"(?:str\.|strada|bd\.|b-dul|bulevardul|calea|aleea|sos\.|soseaua|piata|splaiul|intrarea)"
-ADDRESS_CONT = re.compile(r"\b(nr|bl|sc|et|ap|jud|judet|mun|municipiul|oras|or|sat|com|comuna|sector|cod)\b\.?", re.I)
-STOP_WORDS = re.compile(r"\b(cnp|domiciliat|domiciliu|nascut|nascuta|seria|legitimat|posesor|cu|in|în|"
+ADDRESS_CONT = re.compile(r"\b(nr|bl|sc|et|ap|jud|judet|mun|municipiul|oras|or|sat|com|comuna|sector|sec|cod)\b\.?", re.I)
+# localities: county / town markers and the largest cities (prefixes, so OCR'd "Bucur" still counts)
+LOCALITY_CUE = re.compile(r"^(?:mun|jud|judet\w*|sec|sector|com|comuna|oras|or|sat|municipiul)\.?\d*$|"
+                          r"^(?:bucur|cluj|iasi|timis|const|craiov|brasov|galat|ploies|orade|brail|arad|pites|sibiu|"
+                          r"bacau|targu|baia|buzau|botos|satu|ramnic|suceav|piatr|drobet|focsan|tulce|resit|slatin|"
+                          r"calara|giurg|deva|hunedo|bistri|alba|zalau|sfant|vaslu|slobo|alexan|tarnov|medias)", re.I)
+STOP_WORDS = re.compile(r"\b(cnp|domiciliat|domiciliu|nascut|nascuta|seria|sera|sena|legitimat|posesor|cu|in|în|"
                         r"data|tel|telefon\w*|e-?mails?|iban|adres\w*|identificat|act|furnizor\w*|total)\b", re.I)
 NAME_TOKEN = re.compile(r"^[A-ZĂÂÎȘŞȚŢ][A-Za-zĂÂÎȘŞȚŢăâîșşțţ\-]{1,}$")
 LABEL_WORD = re.compile(r"^(nume|prenume|nom|prenom|last|first|name|si|și|/)$", re.I)
@@ -95,30 +127,36 @@ LABEL_ONLY_REST = re.compile(r"[\s/:.\-]*(?:(?:nume|prenume|nom|prenom|last|firs
 ADDR_EXCLUDE = re.compile(r"\b(CNP|seria|emis[aă]?|valabil\w*|telefon|tel|e-?mail|IBAN)\b", re.I)
 
 # --- Romanian ID card (CI / buletin) fields -----------------------------------------------------------------
-ID_CARD_CONTEXT = re.compile(r"CARTE\s+DE\s+IDENTITATE|IDENTITY\s+CARD|CARTE\s+D.?IDENTITE|BULETIN|"
-                             r"CARTE\s+DE\s+IDENTITATE\s+PROVIZORIE|IDROU", re.I)
-ISSUER_LABEL = re.compile(r"(?:emis[aă]?|eliberat[aă]?)\s+de|d[eé]livr[eé]e?\s+par|[il1|]ssued\s+by|"
+ID_CARD_CONTEXT = re.compile(r"CARTE\s*DE\s*" + fz("identitate") + r"|IDENTITY\s+CARD|CARTE\s+D.?IDENTITE|"
+                             + fz("buletin") + r"|[I1l]D[R][O0]U", re.I)
+ISSUER_LABEL = re.compile(r"(?:" + fz("emis") + r"[aă]?|eliberat[aă]?)\s+de|d[eé]livr[eé]e?\s+par|[il1|]ssued\s+by|"
                           r"autoritate(?:a)?\s+emitent[aă]", re.I)
 # words that belong to the multilingual issuer label itself, never to the value
 ISSUER_LABEL_WORDS = re.compile(r"^[\s/:.\-]*(?:emis[aă]?|eliberat[aă]?|de|d[eé]livr[eé]e?|par|[il1|]ssued|by|"
                                 r"autoritate(?:a)?|emitent[aă]?)[\s/:.\-]*$", re.I)
-ISSUER_BARE = re.compile(r"\b(?:S\.?P\.?C\.?L\.?E\.?P|S\.?P\.?C\.?E\.?P|D\.?E\.?P\.?A\.?B\.?D)\.?\s+[A-Z][\w.\-]*(?:\s+[A-Z0-9][\w.\-]*){0,3}|"
+ISSUER_BARE = re.compile(r"\bD\.?E\.?P\.?A\.?B\.?D\b\.*|"           # Bucharest records office, usually alone
+                         r"\b(?:S\.?P\.?C\.?L\.?E\.?P|S\.?P\.?C\.?E\.?P)\.?\s+[A-Z][\w.\-]*(?:\s+[A-Z0-9][\w.\-]*){0,3}|"
                          r"\bPoli[tț]ia\s+(?:mun\.?|municipiului|ora[sș]ului|jud\.?)?\s*[A-Z][\w\-]*(?:\s+[A-Z0-9][\w\-]*){0,2}", re.I)
-VALIDITY_LABEL = re.compile(r"valabil\w*|validit[eé]\w*|validity|data\s+(?:eliber[aă]rii|emiterii|expir[aă]rii)|"
+VALIDITY_LABEL = re.compile(fz("valabil") + r"\w*|validit[eé]\w*|validity|data\s+(?:eliber[aă]rii|emiterii|expir[aă]rii)|"
                             r"date\s+of\s+(?:issue|expiry)|expir[aă]rii", re.I)
 # dates printed with spaces on the electronic ID (2021+): "03 07 1983"
 DATE_SPACED_RE = re.compile(r"(?<![\d.])(0?[1-9]|[12]\d|3[01])\s+(0?[1-9]|1[0-2])\s+((?:19|20)\d{2})(?!\d)")
 # electronic ID document number: 2 letters + 7 digits ("SP1236343"); old CI: 2 letters + 6 digits
 ID_DOC_NO = re.compile(r"(?<![A-Z0-9])([A-Z]{2})\s?(\d{7})(?!\d)")
-DOC_NO_LABEL = re.compile(r"nr\.?\s*document|document\s*n[o0]|num[aă]r\s+document", re.I)
-SIGNATURE_LABEL = re.compile(r"semn[aă]tura", re.I)
+DOC_NO_LABEL = re.compile(r"nr\.?\s*" + fz("document") + "|" + fz("document") + r"\s*n[o0]|num[aă]r\s+document", re.I)
+SIGNATURE_LABEL = re.compile(fz("semnatura"), re.I)
 # words of the signature label itself ("Semnatura titularului / Holder's signature"), OCR-tolerant
 SIGNATURE_LABEL_WORDS = re.compile(r"^[\W_]*(?:semn[aă]tura|titularului|h\w{1,3}der\W?s|holder\W?s|signature|/)[\W_]*$", re.I)
 # field-label words used to find where the label column starts on an ID card (portrait sits left of it)
-ID_LABEL_ANCHOR = re.compile(r"^(?:nume|prenume|sex|cnp|nr\.?|semn[aă]tura|data|domiciliu|loc|cet[aă][tț]enie|"
-                             r"seria|emis[aă]?|valabilitate)$", re.I)
-BIRTH_PLACE_LABEL = re.compile(r"loc(?:ul)?\s+(?:de\s+)?na[sș]ter(?:e|ii)|lieu\s+de\s+naissance|place\s+of\s+birth", re.I)
-BIRTH_DATE_LABEL = re.compile(r"data\s+na[sș]terii|date\s+de\s+naissance|date\s+of\s+birth", re.I)
+ID_LABEL_ANCHOR = re.compile(r"^(?:" + "|".join(fz(w) for w in ("nume", "prenume", "semnatura", "domiciliu",
+                                                                "cetatenie", "seria", "emisa", "valabilitate"))
+                             + r"|sex|cnp|c\.n\.p\.?|nr\.?|data|loc)$", re.I)
+BIRTH_PLACE_LABEL = re.compile(r"loc(?:ul)?\s+(?:de\s+)?" + fz("nast") + r"er(?:e|ii)|lieu\s+de\s+naissance|"
+                               r"place\s+of\s+birth", re.I)
+BIRTH_DATE_LABEL = re.compile(r"data\s+" + fz("nasterii") + r"|date\s+de\s+naissance|date\s+of\s+birth", re.I)
+# MRZ line 2 of a Romanian ID even when OCR loses the '<' fillers: series+number, check digit, ROU, birth date
+MRZ_LINE2 = re.compile(r"[A-Z$5]{2}\d{6,7}\W?\d?[R][O0]U\d{6,8}[MF<]?\d{5,}", re.I)
+MRZ_LINE1 = re.compile(r"^[I1l]D[R][O0]U[A-Z<«]{3,}", re.I)
 DATE_RE = re.compile(r"(?<!\d)\d{1,2}[./\-]\d{1,2}[./\-](?:\d{4}|\d{2})(?!\d)")
 DATE_RANGE_RE = re.compile(r"(?<!\d)\d{1,2}[./]\d{1,2}[./]\d{2,4}\s*[-–]\s*\d{1,2}[./]\d{1,2}[./]\d{2,4}(?!\d)")
 
@@ -158,7 +196,9 @@ PATTERNS: dict[str, re.Pattern] = {
     "IBAN": re.compile(r"\bRO\s?\d{2}\s?[A-Z]{4}(?:\s?[A-Z0-9]{4}){4}\b"),
     "PHONE": re.compile(r"(?<![\d])(?:\+40|0040|0)[\s.\-]?(?:7\d{2}|[23]\d{1,2})(?:[\s.\-]?\d{2,3}){2,3}(?![\d])"),
     "CNP": re.compile(r"(?<!\d)[1-9]\d{12}(?!\d)"),
-    "ID_SERIES_LABELED": re.compile(r"\bSERIA\s*[:.]?\s*([A-Z]{2})\s*[,;]?\s*(?:NR\.?|NUMAR(?:UL)?|N[O0]\.?)?\s*[:.]?\s*(\d{6})\b", re.I),
+    # "Seria SV nr 123456", OCR-tolerant: "Sena SV nr", "sera SS, na 099993"
+    "ID_SERIES_LABELED": re.compile(r"\b" + fz("seria") + r"\s*[:.]?\s*([A-Z]{2})\s*[,;.]?\s*(?:N[RA]\.?|NUMAR(?:UL)?|"
+                                    r"N[O0]\.?)?\s*[:.]?\s*(\d{6,7})\b", re.I),
     "ID_SERIES_BARE": re.compile(r"\b([A-Z]{2})\s?(\d{6})\b"),
     "BIRTH_DATE": re.compile(r"(?:data\s+na[sș]terii|n[aă]scut[aă]?\s+(?:la|în|in)?\s*(?:data\s+de)?|date\s+of\s+birth)\s*[:.]?\s*"
                              r"(\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4})", re.I),
@@ -201,6 +241,17 @@ def _words_in_span(line: Line, start: int, end: int) -> list[int]:
     return [line.word_idx[k] for k, (s, e) in enumerate(line.spans) if s < end and e > start]
 
 
+def _one_edit(a: str, b: str) -> bool:
+    """True if a and b differ by at most one substitution / insertion / deletion (OCR slips in names)."""
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b)) <= 1
+    if len(a) > len(b):
+        a, b = b, a
+    return any(b[:k] + b[k + 1:] == a for k in range(len(b)))
+
+
 def _strip_junk(text: str) -> str:
     """Drop OCR junk in front of a label: '| ', '>>: @) ', 'N ', ', 4 ' (non-letters and stray single letters)."""
     return re.sub(r"^(?:[\W\d_]+|\b[A-Za-z]\b)+", "", text).lstrip()
@@ -223,8 +274,9 @@ class PIIDetector:
                 self._nlp = spacy.load("ro_core_news_sm")
             except Exception:
                 self._nlp = None
-        self._name_label_re = re.compile(r"^\s*(?:" + "|".join(NAME_LABELS) + r")\b\s*[:.\-]?\s*", re.I)
-        self._addr_label_re = re.compile(r"(?:^|\b)(?:" + "|".join(ADDRESS_LABELS) + r")\b\s*[:.\-]?\s*", re.I)
+        # label punctuation as OCR reads it: "Adresa:", "Adresa;", "Nume ," (a blurred colon often comes back as ;)
+        self._name_label_re = re.compile(r"^\s*(?:" + "|".join(NAME_LABELS) + r")\b\s*[:.;,\-]?\s*", re.I)
+        self._addr_label_re = re.compile(r"(?:^|\b)(?:" + "|".join(ADDRESS_LABELS) + r")\b\s*[:.;,\-]?\s*", re.I)
         self._addr_start_re = re.compile(r"\b" + ADDRESS_START, re.I)
 
     # ---------------------------------------------------------------- public
@@ -235,9 +287,12 @@ class PIIDetector:
         entities += self._regex_entities(lines, words)
         entities += self._name_entities(lines, words)
         entities += self._address_entities(lines, words)
-        entities += self._mrz_entities(lines)
+        mrz = self._mrz_entities(lines)
+        entities += mrz
+        entities += self._mrz_derived_entities(mrz, lines, words)
         entities += self._id_card_entities(lines, words)
         entities += self._unlabeled_name_entities(lines, words)
+        entities += self._locality_entities(lines, words, entities)
         if self._nlp is not None:
             entities += self._spacy_entities(lines)
         if use_local_slm and slm_base_url and slm_model:
@@ -279,7 +334,8 @@ class PIIDetector:
             for m in PATTERNS["CNP"].finditer(t):
                 if cnp_is_valid(m.group(0)):
                     out.append(Entity("CNP", m.group(0), _words_in_span(line, *m.span()), 0.99))
-                elif (id_context or re.search(r"\bCNP\b", t + " " + prev, re.I)) and t.count("<") < 2:
+                elif (id_context or re.search(CNP_LABEL, t + " " + prev, re.I)) and t.count("<") < 2 \
+                        and not MRZ_LINE2.search(t.replace(" ", "")):
                     # (MRZ lines contain 13-digit runs too; they are redacted as MRZ)
                     # wrong checksum (OCR slip, or a specimen card): still redact, but never use it for linking
                     out.append(Entity("CNP", m.group(0), _words_in_span(line, *m.span()), 0.6, "context"))
@@ -302,7 +358,7 @@ class PIIDetector:
             for m in PATTERNS["BIRTH_DATE"].finditer(t):
                 out.append(Entity("BIRTH_DATE", m.group(1), _words_in_span(line, *m.span(1)), 0.9, "context"))
             # Lenient CNP: 13 noisy chars right after a CNP label (OCR confusions O->0, l->1 ...)
-            for m in re.finditer(r"\bCNP\b\s*[:.]?\s*(\S{12,15})", t, re.I):
+            for m in re.finditer(CNP_LABEL + r"\s*[:.]?\s*(\S{12,15})", t, re.I):
                 raw = m.group(1).strip(".,;:")
                 fixed = raw.translate(OCR_DIGIT_FIX)
                 fixed = re.sub(r"\D", "", fixed)
@@ -344,15 +400,22 @@ class PIIDetector:
     def _name_entities(self, lines: list[Line], words: list[Word]) -> list[Entity]:
         out: list[Entity] = []
         for li, line in enumerate(lines):
-            for m in re.finditer(r"(?:^|(?<=[\s/]))(?:" + "|".join(NAME_LABELS) + r")\b\s*[:.\-]?\s*",
+            for m in re.finditer(r"(?:^|(?<=[\s/]))(?:" + "|".join(NAME_LABELS) + r")\b\s*[:.;,\-]?\s*",
                                  line.norm, re.I):
                 label = m.group(0).strip().lower()
                 if label.startswith("semnatura") and not line.norm[m.end():].strip():
                     continue
-                idx = self._take_name_tokens(line, m.end(), words)
+                # bilingual ID-card label ("Nume/Nom/Last name"): the value is never to its right — what OCR puts
+                # there is noise from the background guilloche ("PF Pact") — so only look below it
+                bilingual = "/" in line.norm[max(0, m.start() - 1):m.end() + 1]
+                idx = [] if bilingual else self._take_name_tokens(line, m.end(), words)
                 # label alone on its line (ID-card layout) -> value is on the next line. OCR junk such as '| '
                 # may precede the label, and the rest of the line holds the translation ('/Surname', '/Given names').
-                label_starts_line = not _strip_junk(line.norm[:m.start()])
+                # only look at the next line when the label is effectively alone ("Subsemnata [blurred] la data"
+                # has a value slot on its own line — after redaction the next line is NOT its value)
+                rest = line.norm[m.end():]
+                alone = not _strip_junk(rest) or bool(LABEL_ONLY_REST.fullmatch(rest))
+                label_starts_line = (not _strip_junk(line.norm[:m.start()]) and alone) or bilingual
                 if not idx and label_starts_line and li + 1 < len(lines):
                     nxt = lines[li + 1]
                     if not self._is_field_label(nxt.norm):      # e.g. "Loc nastere/..." once the name is redacted
@@ -364,12 +427,37 @@ class PIIDetector:
                                     and re.search(r"[A-Za-z]{2,}", words[i].text)]
                             if more and not rest and all(words[i].text.strip(",.;:").isupper() for i in more):
                                 idx = idx + more
+                if not idx and bilingual:                    # OCR ordered the lines differently: go by position
+                    idx = self._value_below(line, m, lines, words)
                 if idx:
                     value = " ".join(_fix_capital_i(words[i].text.strip(",.;:")) for i in idx)
-                    kind = "surname" if re.match(r"^(nume(le)?|nom|last\s*name)\b", label) and "prenume" not in label \
-                        else "given" if re.match(r"^(prenume(le)?|prenom|first\s*name)\b", label) else "full"
+                    is_given = re.match(r"^(?:" + FZ_PRENUME + r"(?:le)?|prenom|first\s*name)\b", label, re.I)
+                    is_sur = re.match(r"^(?:" + FZ_NUME + r"(?:le)?|nom|last\s*name)\b", label, re.I)
+                    has_both = is_sur and re.search(FZ_PRENUME, label[2:], re.I)      # "Nume si prenume"
+                    kind = "given" if is_given else "full" if has_both else "surname" if is_sur else "full"
                     out.append(Entity("PERSON_NAME", value, idx, 0.9, f"context:{kind}"))
         return out
+
+    def _value_below(self, line: Line, m: re.Match, lines: list[Line], words: list[Word]) -> list[int]:
+        """Name tokens located geometrically under a label: starting within ~3 label heights below it and
+        horizontally overlapping the label (tolerates skew and lines that OCR orders differently)."""
+        lab = _words_in_span(line, m.start(), m.end())
+        if not lab:
+            return []
+        lx0 = min(words[i].x for i in lab)
+        lh = max(words[i].h for i in lab)
+        ly1 = max(words[i].y + words[i].h for i in lab)
+        cands = [ln for ln in lines if ln is not line and not self._is_field_label(ln.norm)
+                 and ly1 - 0.3 * lh <= min(words[i].y for i in ln.word_idx) <= ly1 + 3 * lh]
+        for ln in sorted(cands, key=lambda ln: min(words[i].y for i in ln.word_idx)):
+            near = [i for i in ln.word_idx if words[i].x + words[i].w >= lx0 - 2 * lh]
+            if not near:
+                continue
+            start = ln.spans[ln.word_idx.index(near[0])][0]
+            idx = self._take_name_tokens(ln, start, words, value_line=True)
+            if idx:
+                return idx
+        return []
 
     # ---------------------------------------------------------------- addresses
     def _address_entities(self, lines: list[Line], words: list[Word]) -> list[Entity]:
@@ -428,6 +516,40 @@ class PIIDetector:
             clean_ratio = len(re.findall(r"[A-Z0-9<«]", compact.upper())) / max(len(compact), 1)
             if compact.count("<") + compact.count("«") >= 2 and len(compact) >= 20 and clean_ratio >= 0.85:
                 out.append(Entity("MRZ", compact, list(line.word_idx), 0.9))
+            elif len(compact) >= 20 and (MRZ_LINE1.search(compact) or MRZ_LINE2.search(compact)):
+                out.append(Entity("MRZ", compact, list(line.word_idx), 0.85, "pattern"))   # fillers lost by OCR
+        return out
+
+    def _mrz_derived_entities(self, mrz: list[Entity], lines: list[Line], words: list[Word]) -> list[Entity]:
+        """The MRZ spells out surname, given names and document number in a fixed format — use them to find
+        the same values printed (and possibly badly OCR'd) elsewhere on the card."""
+        names: set[str] = set()
+        numbers: set[str] = set()
+        for e in mrz:
+            v = e.value.upper().replace("«", "<")
+            m1 = MRZ_LINE1.search(v)
+            if m1:
+                body = re.sub(r"^[I1L]D[R][O0]U", "", v)
+                names |= {t for t in re.split(r"<+", body) if len(t) >= 3 and t.isalpha()}
+            # document number = the start of MRZ line 2 (anchored: the birth date / CNP digits come later)
+            m2 = re.match(r"[^A-Z0-9$]*[A-Z0-9$]{2}(\d{6,7})(?=\W?\d?[R][O0]U)", v)
+            if m2:
+                numbers.add(m2.group(1))
+        if not names and not numbers:
+            return []
+        mrz_words = {i for e in mrz for i in e.word_indices}
+        out: list[Entity] = []
+        for line in lines:
+            for i in line.word_idx:
+                if i in mrz_words:
+                    continue
+                raw = words[i].text.strip(",.;:|()[]{}")
+                tok = strip_diacritics(_fix_capital_i(raw)).upper()
+                if len(tok) >= 3 and any(tok == n or (len(n) >= 5 and _one_edit(tok, n)) for n in names):
+                    out.append(Entity("PERSON_NAME", raw, [i], 0.85, "mrz"))
+                digits = re.sub(r"\D", "", raw)
+                if len(digits) >= 6 and any(n in digits for n in numbers):
+                    out.append(Entity("ID_SERIES", raw, [i], 0.85, "mrz"))
         return out
 
     # ---------------------------------------------------------------- Romanian ID card fields
@@ -511,7 +633,7 @@ class PIIDetector:
                 rest = t[start:]
                 start += len(rest) - len(rest.lstrip(" /:.-"))
                 idx = value_after(li, start)
-                if idx and re.search(r"[A-Za-z]{2,}", text_of(idx)):
+                if idx and re.search(r"[A-Za-z]{3,}", text_of(idx)):
                     out.append(Entity("BIRTH_PLACE", text_of(idx), idx, 0.85, "context"))
             # birth date whose value sits on the next line (new CI layout)
             bm = BIRTH_DATE_LABEL.search(t)
@@ -520,6 +642,35 @@ class PIIDetector:
                 d = DATE_RE.search(nxt.norm)
                 if d:
                     out.append(Entity("BIRTH_DATE", d.group(0), _words_in_span(nxt, *d.span()), 0.85, "context"))
+        return out
+
+    def _locality_entities(self, lines: list[Line], words: list[Word], found: list[Entity]) -> list[Entity]:
+        """On identity documents, a run starting at a locality marker ("Mun.", "Jud.", "Sec.4") or a large
+        city ("Bucuresti", even OCR'd as "Bucur") is a domicile / birth-place fragment — wherever it sits.
+        Only adds what no other rule already covered."""
+        if not ID_CARD_CONTEXT.search(" ".join(l.norm for l in lines)):
+            return []
+        covered = {i for e in found for i in e.word_indices}
+        label_stop = re.compile(r"^(?:of|birth|lieu|naissance|place|sex|sexe|adresse|address|issued|by|par|"
+                                r"nationality|nationalite)$", re.I)
+        out: list[Entity] = []
+        for line in lines:
+            if self._is_field_label(line.norm) or line.text.count("<") >= 2:
+                continue
+            toks = [strip_diacritics(words[i].text).strip(",.;:|()[]{}") for i in line.word_idx]
+            start = next((k for k, t in enumerate(toks) if t and LOCALITY_CUE.match(t)), None)
+            if start is None:
+                continue
+            if start > 0 and re.fullmatch(r"[A-Za-z]{2,4}\.?", toks[start - 1]):   # garbled "Mun." before a city
+                start -= 1
+            idx = []
+            for k in range(start, len(toks)):
+                if label_stop.match(toks[k]) or re.search(r"[A-Za-z]/[A-Za-z]", toks[k]):
+                    break
+                idx.append(line.word_idx[k])
+            idx = [i for i in idx if i not in covered]
+            if idx and re.search(r"[A-Za-z]{3,}", " ".join(words[i].text for i in idx)):
+                out.append(Entity("ADDRESS", " ".join(words[i].text for i in idx), idx, 0.7, "locality"))
         return out
 
     @staticmethod
@@ -706,40 +857,131 @@ def entity_boxes(entities: list[Entity], words: list[Word], gap_factor: float = 
     return boxes
 
 
+# ----------------------------------------------------------------------------
+# Faces (OpenCV YuNet) — layout-independent portrait detection
+# ----------------------------------------------------------------------------
+def _yunet(img, threshold: float) -> list[tuple[float, float, float, float, float]]:
+    """(x, y, w, h, score) of faces in a BGR image, using OpenCV's YuNet model (models/ folder)."""
+    import cv2
+    from server import config
+    if not os.path.isfile(config.FACE_MODEL_PATH):
+        return []
+    try:
+        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+    except Exception:
+        pass
+    h, w = img.shape[:2]
+    long_side = max(h, w)
+    s = 1280 / long_side if long_side > 1280 else (640 / long_side if long_side < 640 else 1.0)  # small scans: upscale
+    small = cv2.resize(img, (max(1, int(w * s)), max(1, int(h * s))))
+    det = cv2.FaceDetectorYN.create(config.FACE_MODEL_PATH, "", (small.shape[1], small.shape[0]), threshold, 0.3, 5000)
+    _, faces = det.detect(small)
+    if faces is None:
+        return []
+    return [(f[0] / s, f[1] / s, f[2] / s, f[3] / s, float(f[14])) for f in faces]
+
+
+def _rotate_bound(img, angle: float):
+    """Rotate without cropping; returns (image, inverse affine matrix back to the original frame)."""
+    import cv2
+    import numpy as np
+    h, w = img.shape[:2]
+    m = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+    cos, sin = abs(m[0, 0]), abs(m[0, 1])
+    nw, nh = int(h * sin + w * cos), int(h * cos + w * sin)
+    m[0, 2] += nw / 2 - w / 2
+    m[1, 2] += nh / 2 - h / 2
+    rotated = cv2.warpAffine(img, m, (nw, nh), borderValue=(255, 255, 255))
+    return rotated, cv2.invertAffineTransform(m), np
+
+
+def _ghost_faces(gray, face: tuple[int, int, int, int]) -> list[tuple[int, int, int, int]]:
+    """The faint, smaller 'ghost' copy of the portrait printed on many ID cards: template-match the detected
+    face (contrast-normalised) at smaller scales elsewhere on the card. Accepted only with a clear winner."""
+    import cv2
+    import numpy as np
+    x, y, w, h = face
+    g = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
+    tpl = g[max(0, y):y + h, max(0, x):x + w]
+    if tpl.size == 0 or min(tpl.shape) < 12:
+        return []
+    H, W = g.shape
+    best: tuple[float, float, tuple[int, int], tuple[int, int]] | None = None
+    for s in np.linspace(0.3, 0.9, 13):
+        t = cv2.resize(tpl, (max(8, int(w * s)), max(8, int(h * s))))
+        if t.shape[0] >= H or t.shape[1] >= W:
+            continue
+        r = cv2.matchTemplate(g, t, cv2.TM_CCOEFF_NORMED)
+        r[max(0, y - t.shape[0]):y + h, max(0, x - t.shape[1]):x + w] = -1     # not the portrait itself
+        _, top, _, loc = cv2.minMaxLoc(r)
+        th, tw = t.shape
+        r2 = r.copy()                                                            # runner-up elsewhere
+        r2[max(0, loc[1] - th):loc[1] + th, max(0, loc[0] - tw):loc[0] + tw] = -1
+        _, second, _, _ = cv2.minMaxLoc(r2)
+        if best is None or top > best[0]:
+            best = (top, second, loc, (tw, th))
+    if best and best[0] >= 0.42 and best[0] - best[1] >= 0.06:
+        (gx, gy), (gw, gh) = best[2], best[3]
+        return [(gx, gy, gw, gh)]
+    return []
+
+
 def _face_boxes(image_path: str, page_no: int) -> list[tuple[int, int, int, int, int]]:
-    """Faces via OpenCV's Haar cascade, when the model file ships with the installed OpenCV build."""
+    """Faces anywhere on the page (any layout), padded to cover hair, ears and chin, plus a ghost photo.
+
+    Tries the upright page first, then rotated copies (sideways / tilted photos of cards)."""
     try:
         import cv2
-        cascade_path = os.path.join(getattr(cv2, "data", None).haarcascades, "haarcascade_frontalface_default.xml")
-        if not os.path.isfile(cascade_path):
-            return []
-        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        from server import config
+        img = cv2.imread(image_path)
         if img is None:
             return []
-        faces = cv2.CascadeClassifier(cascade_path).detectMultiScale(
-            img, scaleFactor=1.1, minNeighbors=5, minSize=(max(40, img.shape[1] // 20),) * 2)
+        H, W = img.shape[:2]
+        found = [(x, y, w, h) for x, y, w, h, _ in _yunet(img, config.FACE_SCORE_THRESHOLD)]
+        if not found:
+            for angle in (90, -90, 180, 20, -20, 35, -35):
+                rot, inv, np = _rotate_bound(img, angle)
+                hits = _yunet(rot, config.FACE_SCORE_THRESHOLD)
+                for x, y, w, h, _ in hits:
+                    corners = np.array([[x, y, 1], [x + w, y, 1], [x, y + h, 1], [x + w, y + h, 1]]).T
+                    pts = inv @ corners
+                    x0, y0, x1, y1 = pts[0].min(), pts[1].min(), pts[0].max(), pts[1].max()
+                    found.append((x0, y0, x1 - x0, y1 - y0))
+                if found:
+                    break
+        found = [(int(x), int(y), int(w), int(h)) for x, y, w, h in found if w > 8 and h > 8]
+        if found:
+            biggest = max(found, key=lambda f: f[2] * f[3])
+            found += _ghost_faces(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), biggest)
     except Exception:
         return []
+    r = config.FACE_PADDING_RATIO
     out = []
-    for (x, y, w, h) in faces:                      # grow the box to cover hair, ears and chin
-        gx, gy = int(w * 0.35), int(h * 0.5)
-        out.append((page_no, max(0, x - gx), max(0, y - gy), w + 2 * gx, h + 2 * gy))
+    for x, y, w, h in found:                       # sides r, more room above (hair) than below (chin)
+        x0, y0 = max(0, int(x - r * w)), max(0, int(y - 1.6 * r * h))
+        x1, y1 = min(W, int(x + w + r * w)), min(H, int(y + h + 1.2 * r * h))
+        out.append((page_no, x0, y0, x1 - x0, y1 - y0))
     return out
 
 
 def portrait_boxes(words: list[Word], pages: list) -> list[tuple[int, int, int, int, int]]:
-    """Boxes over the holder's photo on identity cards.
+    """Boxes over faces / the holder's photo, on any document.
 
-    Layout rule (works without any model): on a Romanian CI the portrait is the text-free block left of the
-    field labels, between the card title and the MRZ. If the labels start further than 20% into the page,
-    that block is redacted. A Haar face detector is used in addition when its model file is available."""
+    1. Face detection (YuNet) on every page, whatever the layout, including rotated photos and ghost images.
+    2. Only on identity documents where no face was found: the layout rule — the text-free block left of the
+       field labels, between the card title and the MRZ.
+    3. On identity documents: the handwritten signature area under the signature label."""
     lines = build_lines(words)
-    if not lines or not ID_CARD_CONTEXT.search(" ".join(l.norm for l in lines)):
-        return []
+    is_id = bool(lines) and bool(ID_CARD_CONTEXT.search(" ".join(l.norm for l in lines)))
     boxes: list[tuple[int, int, int, int, int]] = []
     for page in pages:
+        faces = _face_boxes(page.base_image_path, page.number)
+        boxes += faces
         plines = [l for l in lines if words[l.word_idx[0]].page == page.number]
-        if not plines:
+        if not is_id or not plines:
+            continue
+        boxes += _signature_boxes(plines, words, page)
+        if faces:
             continue
 
         def bottom(l: Line) -> int:
@@ -770,11 +1012,11 @@ def portrait_boxes(words: list[Word], pages: list) -> list[tuple[int, int, int, 
             margin = int(page.width * 0.02)
             gap = max(4, int(page.width * 0.004))           # labels sit close to the photo on the electronic ID
             if left > page.width * 0.2 and band_bottom - band_top > page.height * 0.15:
-                # start right under the card title: on the electronic ID the hair reaches up to the header row
-                boxes.append((page.number, margin, band_top + gap, left - gap - margin,
+                # start right under the card title: on the electronic ID the hair reaches up to the header row.
+                # The redactor pads every box (capped at 1.5% of the long side): leave that room before the labels.
+                pad = int(0.015 * max(page.width, page.height))
+                boxes.append((page.number, margin, band_top + gap, max(1, left - gap - margin - pad),
                               band_bottom - band_top - gap - margin))
-        boxes += _signature_boxes(plines, words, page)
-        boxes += _face_boxes(page.base_image_path, page.number)
     return boxes
 
 
@@ -797,6 +1039,55 @@ def _signature_boxes(plines: list[Line], words: list[Word], page) -> list[tuple[
         bw, bh = min(page.width, x1 + h) - bx, min(page.height, y1 + int(5.5 * h)) - by
         if bw > 0 and bh > 0:
             out.append((page.number, bx, by, bw, bh))
+    return out
+
+
+def unread_value_boxes(words: list[Word], pages: list) -> list[tuple[int, int, int, int, int]]:
+    """A name / signature label that ends its line with nothing OCR-readable after it ("Semnatura client:"
+    with the handwriting or a faint name OCR could not read) -> blur the space right of it on that row.
+    Bilingual ID-card labels ("Nume/Nom/Last name") are skipped: their value sits below, not to the right."""
+    lines = build_lines(words)
+    label_re = re.compile(r"(?:^|(?<=[\s/]))(?:" + "|".join(NAME_LABELS) + r")\b(?:\s+client(?:ului)?)?\s*[:.;,\-]?\s*$",
+                          re.I)
+    widths = {p.number: p.width for p in pages}
+    out = []
+    for line in lines:
+        m = label_re.search(line.norm)
+        if not m or "/" in line.norm:
+            continue
+        lab = _words_in_span(line, m.start(), m.end())
+        if not lab:
+            continue
+        pg = words[lab[0]].page
+        x1 = max(words[i].x + words[i].w for i in lab)
+        y0 = min(words[i].y for i in lab)
+        h = max(words[i].h for i in lab)
+        bx = x1 + max(2, h // 3)
+        bw = min(widths.get(pg, bx + 12 * h) - bx, 12 * h)
+        if bw > h:
+            out.append((pg, bx, max(0, y0 - h // 4), bw, int(h * 1.5)))
+    return out
+
+
+def extend_into_unread(boxes: list[tuple[int, int, int, int, int]], words: list[Word], page_widths: dict[int, int],
+                       max_factor: float = 3.0) -> list[tuple[int, int, int, int, int]]:
+    """Grow each text box to the right through space where OCR read nothing, up to the next word it did read
+    on the same row (max `max_factor` x box height). OCR often drops the tail of a value (stamps, holograms,
+    guilloche over 'Sec. 2'); a box that ends where the OCR'd words end would leave that tail readable."""
+    out = []
+    for (pg, x, y, w, h) in boxes:
+        if h <= 0 or w > 8 * h * 10:                # skip non-text boxes (portraits etc. are handled whole)
+            out.append((pg, x, y, w, h))
+            continue
+        right = x + w
+        limit = min(page_widths.get(pg, right), right + int(max_factor * h))
+        for wd in words:
+            if wd.page != pg or wd.x < right:
+                continue
+            overlap = min(y + h, wd.y + wd.h) - max(y, wd.y)
+            if overlap >= 0.4 * min(h, wd.h):
+                limit = min(limit, wd.x - max(2, h // 6))
+        out.append((pg, x, y, max(w, limit - x), h))
     return out
 
 

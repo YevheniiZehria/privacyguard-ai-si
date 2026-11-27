@@ -194,3 +194,72 @@ def test_electronic_id_card_2021_layout_with_ocr_junk():
     assert "06 04 2035" in by_type["ID_DATE"]
     assert by_type.get("CAN")                                  # card access number next to the signature label
     assert "ROU" not in " ".join(v for vs in by_type.values() for v in vs)
+
+
+def test_ocr_tolerant_labels():
+    first12 = "196052333123"
+    cnp = first12 + cnp_control_digit(first12)
+    words = make_words([
+        "CARTE DE IDENTITATE",
+        "Sena SV nr 123456",                     # 'ri' read as 'n'
+        "C.N.P. " + cnp,
+        "Prenurne/Prenom/First name",            # 'm' read as 'rn'
+        "ANDREI",
+        "Domiciliul/Adresse/Address",
+        "Str. Lalelelor nr. 10",
+    ])
+    by_type: dict[str, list[str]] = {}
+    for e in PIIDetector(use_spacy=False).detect(words):
+        by_type.setdefault(e.type, []).append(e.value)
+    assert "SV123456" in by_type["ID_SERIES"]
+    assert cnp in by_type["CNP"]
+    assert "ANDREI" in by_type["PERSON_NAME"]
+    assert any("Lalelelor" in v for v in by_type["ADDRESS"])
+
+
+def test_old_ci_low_quality_ocr_uses_mrz_and_localities():
+    """Real-world OCR of a 600 px old CI: garbled labels, junk right of bilingual labels, MRZ fillers lost."""
+    words = make_words([
+        "ROUMANIE ] ROMANIA",
+        "CARTE CARTE DE IDENTITATE IDENTITY",
+        "sera SS, na 099993 CARD",
+        "Nume/Nom/Last name PF Pact fo |",
+        "POPESCU 1 A:",
+        "MARIN ee _]",
+        "Ma Bucur a of birth i ,",
+        "Mun. Sec.4 Sb",
+        "900 Ca Str. Rudarilor nr.14 bl.3 sc.1 et.2 ap.7",
+        "es DEPAB.D.. 02.06.21-13.09.2081",
+        "IDROUPOPESCU<<MARIN<<<<<<<<< <<<",
+        "$$099993<3R0U46091354M810913314000881",
+    ])
+    ents = PIIDetector(use_spacy=False).detect(words)
+    by_type: dict[str, list[str]] = {}
+    for e in ents:
+        by_type.setdefault(e.type, []).append(e.value)
+    assert "SS099993" in by_type["ID_SERIES"]
+    names = by_type["PERSON_NAME"]
+    assert "POPESCU" in names and "MARIN" in names and not any("Pact" in n for n in names)
+    assert len(by_type["MRZ"]) == 2                       # line 2 found even without '<' fillers
+    assert any("DEPAB" in v for v in by_type["ISSUER"])
+    addr = " ".join(by_type["ADDRESS"])
+    assert "Bucur" in addr and "Sec.4" in addr and "Rudarilor" in addr
+
+
+def test_face_model_present_and_quiet_on_blank_page(tmp_path):
+    import numpy as np
+    from server import config
+    from server.image_preprocessing import save_png
+    from server.pii_detector import _face_boxes
+    import os
+    assert os.path.isfile(config.FACE_MODEL_PATH), "models/face_detection_yunet_2023mar.onnx missing"
+    p = tmp_path / "blank.png"
+    save_png(str(p), np.full((600, 900, 3), 255, np.uint8))
+    assert _face_boxes(str(p), 1) == []
+
+
+def test_box_tail_extends_only_into_unread_space():
+    from server.pii_detector import extend_into_unread
+    words = [Word("Value", 100, 10, 80, 30, 95, 1, (1, 1, 1, 0)), Word("Next", 400, 12, 60, 30, 95, 1, (1, 1, 1, 0))]
+    (_, x, y, w, h), = extend_into_unread([(1, 100, 10, 80, 30)], words, {1: 1000})
+    assert x == 100 and x + w > 180 and x + w <= 400 - 2        # grew right, stopped before the next OCR'd word

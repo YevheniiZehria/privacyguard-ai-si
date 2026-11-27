@@ -11,9 +11,9 @@ from server import config
 from server.entity_linker import EntityLinker, entity_hashes
 from server.ocr_engine import ocr_file, ocr_image
 from server.image_preprocessing import load_bgr
-from server.pii_detector import (PIIDetector, build_lines, entity_boxes, portrait_boxes, strip_diacritics,
-                                 summarize)
-from server.redactor import redact_pages
+from server.pii_detector import (PIIDetector, build_lines, entity_boxes, extend_into_unread, portrait_boxes,
+                                 strip_diacritics, summarize, unread_value_boxes)
+from server.redactor import effective_padding, redact_pages
 from server.vault import DetectionRecord, DocumentRecord, RedactionRecord, Vault
 
 
@@ -48,7 +48,10 @@ class PrivacyPipeline:
         entities = self.detector.detect(doc.words, use_local_slm=use_local_slm,
                                         slm_base_url=config.LOCAL_SLM_BASE_URL, slm_model=config.LOCAL_SLM_MODEL)
         boxes = entity_boxes(entities, doc.words)
-        portraits = portrait_boxes(doc.words, doc.pages)          # ID-card photo (no text, so not an entity)
+        # cover value tails OCR could not read (only grows into space with no OCR'd words)
+        boxes = extend_into_unread(boxes, doc.words, {p.number: p.width for p in doc.pages})
+        boxes += unread_value_boxes(doc.words, doc.pages)         # "Semnatura client: <unreadable>"
+        portraits = portrait_boxes(doc.words, doc.pages)          # faces / ID photo / signature (no text)
         boxes += portraits
         hashes = entity_hashes(entities, self.vault.hmac_hex)
         det = DetectionRecord(self.vault.new_id("det"), doc_id, entities, boxes, hashes)
@@ -83,11 +86,16 @@ class PrivacyPipeline:
         rec = self.vault.get_result(result_id)
         det = self.vault.get_detection(rec.detection_id)
         residual = 0
-        pad = rec.padding_px + 3
         for page_no, path in enumerate(rec.output_paths, start=1):
             # The redacted image is already deskewed -> same coordinate frame as the redaction boxes.
-            _, words = ocr_image(load_bgr(path), page_no=page_no, deskew=False)
-            boxes = [(x - pad, y - pad, x + w + pad, y + h + pad) for (pg, x, y, w, h) in det.boxes if pg == page_no]
+            img = load_bgr(path)
+            long_side = max(img.shape[:2])
+            _, words = ocr_image(img, page_no=page_no, deskew=False)
+            boxes = []
+            for (pg, x, y, w, h) in det.boxes:          # same margin the redactor used, +3 px tolerance
+                if pg == page_no:
+                    pad = effective_padding(h, rec.padding_px, long_side) + 3
+                    boxes.append((x - pad, y - pad, x + w + pad, y + h + pad))
 
             def on_box(wd) -> bool:   # OCR "text" hallucinated on the edge of a black box is an artifact
                 return any(wd.x < bx1 and wd.x + wd.w > bx0 and wd.y < by1 and wd.y + wd.h > by0

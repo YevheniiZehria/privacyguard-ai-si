@@ -292,8 +292,12 @@ async function onDocAction(e) {
 function openPreview(doc) {
   const finished = FINISHED.includes(doc.status);
   S.preview = { doc, page: 1, pages: doc.page_count || 1, mode: finished ? 'split' : 'original',
-    tf: null, size: null };
+    tf: null, size: null, draw: false };
   $('#previewTitle').textContent = doc.name;
+  $('#manualBtn').classList.toggle('hidden', !finished);
+  $('#manualBtn').classList.remove('active');
+  $('#previewBody').classList.remove('drawing');
+  $('#manualUndo').classList.toggle('hidden', !(doc.manual_boxes && doc.manual_boxes.length));
   $('#preview').classList.remove('hidden');
   renderPreview();
 }
@@ -365,6 +369,36 @@ function zoomPreview(factor, cx, cy) {
   p.tf = { scale: ns, x: cx - (cx - t.x) * k, y: cy - (cy - t.y) * k, fit: false };
   applyPreviewTransform();
 }
+// ---- manual blur box: drag a rectangle on either pane; it is blurred on the redacted page right away
+function setDrawMode(on) {
+  if (!S.preview) return;
+  S.preview.draw = on;
+  $('#manualBtn').classList.toggle('active', on);
+  $('#previewBody').classList.toggle('drawing', on);
+  $$('.draw-hint').forEach((el) => el.remove());
+  if (on) $('.pane-blurred').insertAdjacentHTML('beforeend', '<span class="draw-hint">drag over the area to blur · esc to cancel</span>');
+}
+function toImage(pane, clientX, clientY) {                // screen -> page pixel coordinates
+  const r = pane.getBoundingClientRect(), t = S.preview.tf;
+  return { x: (clientX - r.left - t.x) / t.scale, y: (clientY - r.top - t.y) / t.scale };
+}
+async function applyManualBox(a, b) {
+  const p = S.preview;
+  const x = Math.max(0, Math.round(Math.min(a.x, b.x))), y = Math.max(0, Math.round(Math.min(a.y, b.y)));
+  const w = Math.round(Math.min(p.size.w, Math.max(a.x, b.x)) - x), h = Math.round(Math.min(p.size.h, Math.max(a.y, b.y)) - y);
+  if (w < 3 || h < 3) return;
+  try {
+    const doc = await api(`${docUrl(p.doc)}/manual-redact`, { method: 'POST', json: { page: p.page, x, y, w, h } });
+    p.doc = doc;
+    const keep = p.tf;
+    $('#imgBlurred').src = `${docUrl(doc)}/image/blurred?page=${p.page}&v=${Date.now()}`;   // reload, keep zoom
+    p.tf = keep;
+    $('#manualUndo').classList.remove('hidden');
+    toast(`blurred ${w}×${h}px`);
+    const i = S.docs.findIndex((d) => d.doc_id === doc.doc_id);
+    if (i >= 0) S.docs[i] = doc;
+  } catch (e) { toast(e.message, true); }
+}
 function setupPreviewZoom() {
   let drag = null;
   for (const pane of $$('#previewBody .pane')) {
@@ -376,20 +410,47 @@ function setupPreviewZoom() {
     }, { passive: false });
     pane.addEventListener('pointerdown', (e) => {
       if (!S.preview || !S.preview.tf) return;
-      drag = { pane, x: e.clientX, y: e.clientY, tx: S.preview.tf.x, ty: S.preview.tf.y };
       pane.setPointerCapture(e.pointerId);
+      if (S.preview.draw) {
+        const rect = document.createElement('div');
+        rect.className = 'draw-rect';
+        pane.appendChild(rect);
+        drag = { pane, mode: 'draw', start: toImage(pane, e.clientX, e.clientY), sx: e.clientX, sy: e.clientY, rect };
+        return;
+      }
+      drag = { pane, mode: 'pan', x: e.clientX, y: e.clientY, tx: S.preview.tf.x, ty: S.preview.tf.y };
       pane.classList.add('panning');
     });
     pane.addEventListener('pointermove', (e) => {
       if (!drag || drag.pane !== pane || !S.preview) return;
+      if (drag.mode === 'draw') {
+        const r = pane.getBoundingClientRect();
+        Object.assign(drag.rect.style, {
+          left: `${Math.min(drag.sx, e.clientX) - r.left}px`, top: `${Math.min(drag.sy, e.clientY) - r.top}px`,
+          width: `${Math.abs(e.clientX - drag.sx)}px`, height: `${Math.abs(e.clientY - drag.sy)}px`,
+        });
+        return;
+      }
       S.preview.tf = { ...S.preview.tf, x: drag.tx + e.clientX - drag.x, y: drag.ty + e.clientY - drag.y, fit: false };
       applyPreviewTransform();
     });
-    const end = () => { drag = null; pane.classList.remove('panning'); };
+    const end = (e) => {
+      if (drag && drag.mode === 'draw') {
+        drag.rect.remove();
+        if (e.type === 'pointerup') applyManualBox(drag.start, toImage(pane, e.clientX, e.clientY));
+      }
+      drag = null; pane.classList.remove('panning');
+    };
     pane.addEventListener('pointerup', end);
     pane.addEventListener('pointercancel', end);
-    pane.addEventListener('dblclick', fitPreview);
+    pane.addEventListener('dblclick', () => { if (!S.preview || !S.preview.draw) fitPreview(); });
   }
+  $('#manualBtn').onclick = () => setDrawMode(!(S.preview && S.preview.draw));
+  $('#manualUndo').onclick = async () => {
+    if (!S.preview || !confirm('Remove all manual blur boxes? The document is processed again.')) return;
+    try { await api(`${docUrl(S.preview.doc)}/manual-redact`, { method: 'DELETE' }); closePreview(); toast('manual boxes removed — rescanning'); stopPolling(); refreshFolder(); }
+    catch (e) { toast(e.message, true); }
+  };
   $('#zoomIn').onclick = () => zoomPreview(1.25);
   $('#zoomOut').onclick = () => zoomPreview(0.8);
   $('#zoomFit').onclick = fitPreview;
@@ -448,7 +509,8 @@ function bind() {
   $('#preview').onclick = (e) => { if (e.target.id === 'preview') closePreview(); };
   document.addEventListener('keydown', (e) => {
     if (!S.preview) return;
-    if (e.key === 'Escape') closePreview();
+    if (e.key === 'Escape') { if (S.preview.draw) setDrawMode(false); else closePreview(); return; }
+    if (e.key === 'b' || e.key === 'B') $('#manualBtn').click();
     if (e.key === 'ArrowRight') $('#pageNext').click();
     if (e.key === 'ArrowLeft') $('#pagePrev').click();
     if (e.key === '+' || e.key === '=') zoomPreview(1.25);

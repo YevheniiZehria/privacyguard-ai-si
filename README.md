@@ -94,10 +94,23 @@ labels (`Nume`, `Prenume`, `Subsemnatul/a`, `Client`, `Titular`, `Semnătura`, �
 labels with the value on the next line); addresses after `Domiciliu`/`Adresa`/`Domiciliat în` or starting with
 `Str./Bd./Calea…`, including continuation lines; MRZ lines. **Unlabeled full names** (`Ionescu Maria Elena`,
 `NICHIFOR ANTONIU`) via a lexicon of common Romanian given names + surnames / surname endings, and OCR's `I`→`l`
-slip (`lonescu`) is tolerated. On identity cards (CI / buletin) also: issuing authority (`Emisă de … SPCLEP X`),
-validity / issue dates, place of birth, next-line birth dates, and the **portrait** (text-free block left of the
-field labels; a Haar face detector is added when OpenCV ships its model file). Detected name tokens are
+slip (`lonescu`) is tolerated. Labels are matched **OCR-tolerantly** (`Sena`/`sera` for `Seria`, `C.N.P.`,
+`Prenurne`, `Domiciliul`, …). On identity cards (old CI, electronic ID 2021+, any layout) also: issuing authority
+(`SPCLEP X`, `D.E.P.A.B.D.`), validity / issue / expiry dates (also `03 07 1983`), 2+6 and 2+7 document numbers,
+place of birth, locality fragments (`Mun.`, `Jud.`, `Sec.4`, large cities), card access number, the signature area,
+and names / document number **read from the MRZ** and redacted wherever they appear on the card. Values are found
+right of a label or under it (by line order and by position, tolerant to skew). Detected name tokens are
 propagated to other occurrences (signatures). Optional: spaCy `ro_core_news_sm`, local Ollama SLM.
+
+**Faces / portraits:** OpenCV **YuNet** (`models/face_detection_yunet_2023mar.onnx`, MIT licence, from
+`opencv/opencv_zoo`) finds faces anywhere on any document, retrying rotated copies (90°/180°, ±20°, ±35°); the
+box is padded by `FACE_PADDING_RATIO` (0.3) to cover hair, ears and chin. The faint *ghost* photo on ID cards is
+found by template-matching the detected face. Only when no face is found does an ID-card layout rule apply.
+
+**Blur calibration:** every box gets a margin of `max(REDACTION_MIN_PADDING_PX, REDACTION_PADDING_RATIO × box
+height)` (capped at 1.5% of the image's long side) and is grown right through space where OCR read nothing (value
+tails under stamps); block size and kernel scale with box height and image resolution, so a 3000 px phone photo
+and a 600 px scan are equally unreadable.
 
 **Verification:** the redacted image is re-OCR'd; text hallucinated on or around redacted regions is ignored;
 the detector runs on the remaining visible text and every original PII value is searched for in the new text.
@@ -186,8 +199,11 @@ no build step, no CDN) on top of the same pipeline:
 3. **Folder dashboard** — drag & drop PDF/PNG/JPG files (or click to browse). Every file is queued and run through
    `ocr_document → detect_pii → redact_image → verify_redaction` automatically by one background worker. Status goes
    `[ QUEUED ] → [ SCANNING... ] → [ BLURRED ]` (`[ REVIEW ]` if the verification pass still finds PII-like text,
-   `[ ERROR ]` on failure). Per file: **Preview** (original / redacted / side-by-side, page stepper for PDFs) and
-   **Download** (PNG, or one PDF for multi-page documents); **Download all (.zip)** exports the whole folder.
+   `[ ERROR ]` on failure). Per file: **Preview** (original / redacted / side-by-side, page stepper for PDFs,
+   zoom / pan) with a **`[ + MANUAL BLUR BOX ]`** safety net — drag a rectangle over anything left readable and
+   the same irreversible blur is applied at once (`POST …/documents/{doc}/manual-redact`; boxes survive a rescan,
+   *Undo manual* reprocesses the document) — **Download** (PNG, or one PDF for multi-page documents),
+   **Rescan**, and **Download all (.zip)** for the whole folder.
 
 Folders persist on disk in `workspace_folders/<folder_id>/` (git-ignored; override with `UI_WORKSPACE`):
 `metadata.json` (names, timestamps, statuses and counts only), `original/` (uploads) and `out/` (pipeline output).
