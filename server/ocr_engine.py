@@ -39,7 +39,9 @@ def _tesseract_words(img: np.ndarray, page_no: int, scale: float, langs: str, ps
     for i, raw in enumerate(data["text"]):
         text = (raw or "").strip()
         conf = float(data["conf"][i])
-        if not text or conf < MIN_WORD_CONF:
+        # MRZ strings ('<<<<') get very low Tesseract confidence; keep them so they can be redacted
+        is_mrz_like = text.count("<") >= 2 and len(text) >= 10
+        if not text or (conf < MIN_WORD_CONF and not is_mrz_like):
             continue
         words.append(Word(
             text=text,
@@ -58,10 +60,11 @@ def _avg(words: list[Word]) -> float:
     return float(np.mean([w.conf for w in words])) if words else 0.0
 
 
-def ocr_image(bgr: np.ndarray, page_no: int = 1, langs: str | None = None, psm: int = 6) -> tuple[np.ndarray, list[Word]]:
+def ocr_image(bgr: np.ndarray, page_no: int = 1, langs: str | None = None, psm: int = 6,
+              deskew: bool = True) -> tuple[np.ndarray, list[Word]]:
     """Preprocess + OCR one image. Returns (redaction base image, words in base coords)."""
     langs = langs or config.OCR_LANGS
-    pre = preprocess(bgr)
+    pre = preprocess(bgr, deskew=deskew)
     words = _tesseract_words(pre.ocr_binary, page_no, pre.scale, langs, psm)
     if _avg(words) < LOW_CONF_FALLBACK:
         alt = _tesseract_words(pre.ocr_gray, page_no, pre.scale, langs, psm)

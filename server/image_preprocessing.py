@@ -68,9 +68,9 @@ def save_png(path: str, image: np.ndarray) -> None:
     buf.tofile(path)
 
 
-def preprocess(bgr: np.ndarray) -> Preprocessed:
+def preprocess(bgr: np.ndarray, deskew: bool = True) -> Preprocessed:
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    angle = estimate_skew(gray)
+    angle = estimate_skew(gray) if deskew else 0.0
     if abs(angle) >= 0.3:
         bgr = rotate(bgr, angle)
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)

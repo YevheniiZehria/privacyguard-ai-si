@@ -67,7 +67,7 @@ class PrivacyPipeline:
         if not 0 <= padding_px <= 50:
             raise ValueError("padding_px must be between 0 and 50")
         paths, drawn = redact_pages(doc.pages, det.boxes, doc_id, self.output_dir, padding_px)
-        rec = RedactionRecord(self.vault.new_id("res"), doc_id, detection_id, paths, drawn)
+        rec = RedactionRecord(self.vault.new_id("res"), doc_id, detection_id, paths, drawn, padding_px)
         self.vault.put_result(rec)
         return {"result_id": rec.result_id, "output_path": paths[0], "boxes_drawn": drawn,
                 "page_count": len(paths)}
@@ -77,18 +77,29 @@ class PrivacyPipeline:
         rec = self.vault.get_result(result_id)
         det = self.vault.get_detection(rec.detection_id)
         residual = 0
+        pad = rec.padding_px + 3
         for page_no, path in enumerate(rec.output_paths, start=1):
-            _, words = ocr_image(load_bgr(path), page_no=page_no)
-            # (a) generic re-detection on the redacted image
-            new_entities = self.detector.detect(words)
+            # The redacted image is already deskewed -> same coordinate frame as the redaction boxes.
+            _, words = ocr_image(load_bgr(path), page_no=page_no, deskew=False)
+            boxes = [(x - pad, y - pad, x + w + pad, y + h + pad) for (pg, x, y, w, h) in det.boxes if pg == page_no]
+
+            def on_box(wd) -> bool:   # OCR "text" hallucinated on the edge of a black box is an artifact
+                return any(wd.x < bx1 and wd.x + wd.w > bx0 and wd.y < by1 and wd.y + wd.h > by0
+                           for bx0, by0, bx1, by1 in boxes)
+
+            clean = [wd for wd in words if not on_box(wd)]
+            # (a) generic re-detection on the visible (non-redacted) text
+            new_entities = self.detector.detect(clean)
             residual += len(new_entities)
             # (b) value-level leak check: do any original PII values still appear in the re-OCR text?
             text = re.sub(r"[^A-Z0-9]", "", strip_diacritics(" ".join(l.text for l in build_lines(words))).upper())
             covered = {strip_diacritics(e.value).upper() for e in new_entities}
+            rec.residual_types = [f"{e.type}:{e.source}:{e.value}" for e in new_entities]
             for e in det.entities:
                 v = re.sub(r"[^A-Z0-9]", "", strip_diacritics(e.value).upper())
                 if len(v) >= 5 and v in text and strip_diacritics(e.value).upper() not in covered:
                     residual += 1
+                    rec.residual_types.append(f"LEAK:{e.type}:{e.value}")
         verified = residual == 0
         return {"result_id": result_id, "verified": verified, "residual_pii_count": residual,
                 "status": "PASS" if verified else "FAIL"}

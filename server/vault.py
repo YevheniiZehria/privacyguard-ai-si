@@ -74,6 +74,8 @@ class RedactionRecord:
     detection_id: str
     output_paths: list[str]
     boxes_drawn: int
+    padding_px: int = 4
+    residual_types: list[str] = field(default_factory=list)   # local diagnostics only, never returned
 
 
 class Vault:

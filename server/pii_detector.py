@@ -78,7 +78,7 @@ NAME_LABELS = [
     r"nume\s*(?:si|și|/)?\s*prenume(?:le)?", r"numele\s+si\s+prenumele", r"nume(?:le)?", r"prenume(?:le)?",
     r"subsemnat(?:ul|a)", r"titular(?:ul)?", r"client(?:ul)?", r"beneficiar(?:ul)?", r"cumparator(?:ul)?",
     r"vanzator(?:ul)?", r"locatar(?:ul)?", r"proprietar(?:ul)?", r"solicitant(?:ul)?", r"angajat(?:ul)?",
-    r"catre", r"domnul", r"doamna", r"dl\.?", r"dna\.?", r"last\s*name", r"first\s*name", r"nom", r"prenom",
+    r"domnul", r"doamna", r"dl\.?", r"dna\.?", r"last\s*name", r"first\s*name", r"nom", r"prenom",
     r"semnatura", r"reprezentant(?:ul)?", r"intocmit", r"student(?:ul|a)?",
 ]
 ADDRESS_LABELS = [r"domiciliu(?:l)?", r"domiciliat(?:a)?\s+(?:in|în)", r"adresa(?:\s+de\s+\w+)?",
@@ -89,15 +89,20 @@ STOP_WORDS = re.compile(r"\b(cnp|domiciliat|domiciliu|nascut|nascuta|seria|legit
                         r"data|tel|telefon|email|e-mail|iban|adresa|identificat|act)\b", re.I)
 NAME_TOKEN = re.compile(r"^[A-ZĂÂÎȘŞȚŢ][A-Za-zĂÂÎȘŞȚŢăâîșşțţ\-]{1,}$")
 LABEL_WORD = re.compile(r"^(nume|prenume|nom|prenom|last|first|name|si|și|/)$", re.I)
+LABEL_ONLY_REST = re.compile(r"[\s/:.\-]*(?:(?:nume|prenume|nom|prenom|last|first|name|si|adresse|address|"
+                             r"adresa|domiciliu)[\s/:.\-]*)*", re.I)
+ADDR_EXCLUDE = re.compile(r"\b(CNP|seria|emis[aă]?|valabil\w*|telefon|tel|e-?mail|IBAN)\b", re.I)
 
 PATTERNS: dict[str, re.Pattern] = {
-    "EMAIL": re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"),
+    "EMAIL": re.compile(r"[A-Za-z0-9._%+\-]+(?:\.\s[A-Za-z0-9._%+\-]+)?@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"),
+    # OCR often reads '@' as 'Q', '©' or '(a)'; require a common TLD to stay precise
+    "EMAIL_OCR": re.compile(r"[A-Za-z0-9._%+\-]{2,}(?:Q|©|®|\(a\))[A-Za-z0-9\-]+\.(?:com|ro|net|org|eu|info)\b"),
     "IBAN": re.compile(r"\bRO\s?\d{2}\s?[A-Z]{4}(?:\s?[A-Z0-9]{4}){4}\b"),
     "PHONE": re.compile(r"(?<![\d])(?:\+40|0040|0)[\s.\-]?(?:7\d{2}|[23]\d{1,2})(?:[\s.\-]?\d{2,3}){2,3}(?![\d])"),
     "CNP": re.compile(r"(?<!\d)[1-9]\d{12}(?!\d)"),
     "ID_SERIES_LABELED": re.compile(r"\bSERIA\s*[:.]?\s*([A-Z]{2})\s*[,;]?\s*(?:NR\.?|NUMAR(?:UL)?|N[O0]\.?)?\s*[:.]?\s*(\d{6})\b", re.I),
     "ID_SERIES_BARE": re.compile(r"\b([A-Z]{2})\s?(\d{6})\b"),
-    "BIRTH_DATE": re.compile(r"(?:data\s+na[sș]terii|n[aă]scut[aă]?\s+(?:la|în|in)?|date\s+of\s+birth)\s*[:.]?\s*"
+    "BIRTH_DATE": re.compile(r"(?:data\s+na[sș]terii|n[aă]scut[aă]?\s+(?:la|în|in)?\s*(?:data\s+de)?|date\s+of\s+birth)\s*[:.]?\s*"
                              r"(\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4})", re.I),
 }
 
@@ -180,6 +185,10 @@ class PIIDetector:
             t = line.norm
             for m in PATTERNS["EMAIL"].finditer(t):
                 out.append(Entity("EMAIL", m.group(0), _words_in_span(line, *m.span()), 0.95))
+            if "@" not in t:
+                for m in PATTERNS["EMAIL_OCR"].finditer(t):
+                    out.append(Entity("EMAIL", re.sub(r"Q|©|®|\(a\)", "@", m.group(0), count=1),
+                                      _words_in_span(line, *m.span()), 0.8))
             for m in PATTERNS["IBAN"].finditer(t.upper()):
                 val = m.group(0).replace(" ", "")
                 out.append(Entity("IBAN", val, _words_in_span(line, *m.span()), 0.99 if iban_is_valid(val) else 0.7))
@@ -222,27 +231,29 @@ class PIIDetector:
                 break
             if LABEL_WORD.match(strip_diacritics(tok)) and not picked:
                 continue
-            if NAME_TOKEN.match(tok):
+            if NAME_TOKEN.match(tok) or (picked and re.match(r"^l[a-zăâîșşțţ]{2,}$", tok)):  # OCR: I -> l
                 picked.append(line.word_idx[k])
                 if words[line.word_idx[k]].text.endswith(","):
                     break
                 if len(picked) >= 5:
                     break
-            elif picked:
+            else:   # names must directly follow the label (avoids grabbing e.g. bank codes later on the line)
                 break
         return picked
 
     def _name_entities(self, lines: list[Line], words: list[Word]) -> list[Entity]:
         out: list[Entity] = []
         for li, line in enumerate(lines):
-            for m in re.finditer(r"(?:^|(?<=\s))(?:" + "|".join(NAME_LABELS) + r")\b\s*[:.\-]?\s*",
+            for m in re.finditer(r"(?:^|(?<=[\s/]))(?:" + "|".join(NAME_LABELS) + r")\b\s*[:.\-]?\s*",
                                  line.norm, re.I):
                 label = m.group(0).strip().lower()
                 if label.startswith("semnatura") and not line.norm[m.end():].strip():
                     continue
                 idx = self._take_name_tokens(line, m.end(), words)
                 # label alone on its line (ID-card layout) -> value is on the next line
-                if not idx and not line.norm[m.end():].strip(" :/.-") and li + 1 < len(lines):
+                label_starts_line = not line.norm[:m.start()].strip(" /:.-")
+                if not idx and label_starts_line and LABEL_ONLY_REST.fullmatch(line.norm[m.end():]) \
+                        and li + 1 < len(lines):
                     nxt = lines[li + 1]
                     if not self._name_label_re.match(nxt.norm):
                         idx = self._take_name_tokens(nxt, 0, words)
@@ -268,14 +279,25 @@ class PIIDetector:
             if start is None:
                 continue
             rest = line.norm[start:]
-            stop = re.search(r"\b(CNP|tel(?:efon)?|e-?mail|IBAN|seria|legitimat)\b", rest, re.I)
+            if m and LABEL_ONLY_REST.fullmatch(rest):
+                # label alone on its line (ID-card layout): the address is on the next line(s)
+                if li + 1 < len(lines) and not ADDR_EXCLUDE.search(lines[li + 1].norm) \
+                        and not self._name_label_re.match(lines[li + 1].norm):
+                    idx = list(lines[li + 1].word_idx)
+                    if li + 2 < len(lines) and ADDRESS_CONT.search(lines[li + 2].norm) \
+                            and not self._name_label_re.match(lines[li + 2].norm) \
+                            and not ADDR_EXCLUDE.search(lines[li + 2].norm):
+                        idx += lines[li + 2].word_idx
+                    out.append(Entity("ADDRESS", " ".join(words[i].text for i in idx), idx, 0.85, "context"))
+                continue
+            stop =re.search(r"\b(CNP|tel(?:efon)?|e-?mail|IBAN|seria|legitimat)\b", rest, re.I)
             end = start + (stop.start() if stop else len(rest))
             idx = _words_in_span(line, start, end)
             # continuation line (ID cards wrap the address over two lines)
             if li + 1 < len(lines):
                 nxt = lines[li + 1]
                 if ADDRESS_CONT.search(nxt.norm) and not self._name_label_re.match(nxt.norm) \
-                        and not re.search(r"\b(CNP|seria|emis|valabil)\b", nxt.norm, re.I) and len(nxt.word_idx) <= 10:
+                        and not ADDR_EXCLUDE.search(nxt.norm) and "@" not in nxt.norm and len(nxt.word_idx) <= 10:
                     idx += nxt.word_idx
             if not idx and li + 1 < len(lines) and m:  # label alone on line
                 idx = list(lines[li + 1].word_idx)
@@ -290,7 +312,8 @@ class PIIDetector:
         out = []
         for line in lines:
             compact = line.text.replace(" ", "")
-            if compact.count("<") >= 3 and len(compact) >= 20 and re.fullmatch(r"[A-Z0-9<«]+", compact.upper()):
+            clean_ratio = len(re.findall(r"[A-Z0-9<«]", compact.upper())) / max(len(compact), 1)
+            if compact.count("<") + compact.count("«") >= 2 and len(compact) >= 20 and clean_ratio >= 0.85:
                 out.append(Entity("MRZ", compact, list(line.word_idx), 0.9))
         return out
 
