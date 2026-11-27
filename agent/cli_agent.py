@@ -21,7 +21,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from dotenv import load_dotenv
 from openai import (APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, InternalServerError,
@@ -171,7 +171,17 @@ class Stats:
 
 
 async def run_agent(task: str, files: list[str], provider: str, model: str | None, max_steps: int,
-                    tts: bool, verbose: bool, llm: Any = None) -> int:
+                    tts: bool, verbose: bool, llm: Any = None,
+                    on_event: Callable[[dict], None] | None = None) -> int:
+    """Run the agent. ``on_event`` (optional) receives id-only progress events, e.g. for the web UI."""
+
+    def emit(event: dict) -> None:
+        if on_event is not None:
+            try:
+                on_event(event)
+            except Exception:   # a broken observer must never break the agent
+                pass
+
     preset = PROVIDERS.get(provider, {})
     base_url = os.getenv("LLM_BASE_URL") if provider == "env" else preset["base_url"]
     api_key = (os.getenv("LLM_API_KEY") if provider == "env" or "api_key" not in preset else preset["api_key"])
@@ -181,6 +191,7 @@ async def run_agent(task: str, files: list[str], provider: str, model: str | Non
     if llm is None:
         if not base_url or not model or not api_key:
             print("LLM_BASE_URL / LLM_MODEL / LLM_API_KEY missing — see .env.example", file=sys.stderr)
+            emit({"type": "error", "message": f"No API key / base URL / model configured for provider '{provider}'."})
             return 2
         # Local CPU models need a long first call while the model is loaded into memory
         is_local = any(h in base_url for h in ("localhost", "127.0.0.1"))
@@ -198,6 +209,8 @@ async def run_agent(task: str, files: list[str], provider: str, model: str | Non
         tools = to_openai_tools((await mcp_client.list_tools()).tools)
         user_msg = task + "\n\nInput files (aliases): " + (", ".join(aliases) if aliases else "none")
         messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_msg}]
+        emit({"type": "start", "provider": provider, "model": model, "aliases": list(aliases),
+              "tools": [t["function"]["name"] for t in tools], "llm_user_message": user_msg})
         # Workflow tracker (ids only): lets the agent catch skipped steps and duplicate work by small models
         ocr_cache: dict[str, dict] = {}          # alias -> ocr payload
         result_doc: dict[str, str] = {}          # result_id -> doc_id
@@ -219,6 +232,7 @@ async def run_agent(task: str, files: list[str], provider: str, model: str | Non
                                              tool_choice="auto", temperature=0)
             except Exception as exc:
                 print(f"LLM provider failed permanently: {type(exc).__name__}: {exc}", file=sys.stderr)
+                emit({"type": "error", "message": f"LLM provider failed: {type(exc).__name__}: {exc}"})
                 stats.data["status"] = "failed"
                 break
             msg = resp.choices[0].message
@@ -238,8 +252,10 @@ async def run_agent(task: str, files: list[str], provider: str, model: str | Non
                           file=sys.stderr)
                     messages.append({"role": "user", "content": "Do not ask questions; continue autonomously. "
                                      "Still pending:\n- " + "\n- ".join(todo)})
+                    emit({"type": "nudge", "step": step, "pending": todo, "model_said": msg.content or ""})
                     continue
                 print("\n=== Agent report ===\n" + (msg.content or "(empty)"))
+                emit({"type": "report", "step": step, "content": msg.content or ""})
                 break
 
             for tc in msg.tool_calls:
@@ -283,10 +299,15 @@ async def run_agent(task: str, files: list[str], provider: str, model: str | Non
                 shown = json.dumps(payload, ensure_ascii=False)
                 print(f"[step {step:02d}] {name}({json.dumps(args)}) -> {shown if verbose else shown[:160]}")
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": shown})
+                # `llm_content` is byte-for-byte what the LLM receives for this tool call
+                emit({"type": "tool", "step": step, "tool": name, "args": args, "result": payload,
+                      "llm_content": shown, "privacy_guard": "blocked" if problems else "clean"})
         else:
             stats.data["status"] = "stopped at the step limit"
             print(f"\nMAX_STEPS ({max_steps}) reached — stopping.", file=sys.stderr)
+            emit({"type": "error", "message": f"MAX_STEPS ({max_steps}) reached — stopping."})
 
+    emit({"type": "done", "stats": dict(stats.data)})
     announce(stats.data, enabled=tts)
     return 0 if stats.data["status"] == "completed" else 1
 

@@ -76,5 +76,9 @@ def announce(stats: dict, enabled: bool = True) -> str:
 
 
 if __name__ == "__main__":
-    announce({"documents_processed": 3, "boxes_redacted": 17, "verified_pass": 3, "clusters": 1,
-              "linked_documents": 3})
+    # `python -m agent.tts_notifier '{"documents_processed": 3, ...}'` — used by the web UI (separate process,
+    # because SAPI5 must own its thread); without an argument a demo message is spoken.
+    import json
+    stats = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {
+        "documents_processed": 3, "boxes_redacted": 17, "verified_pass": 3, "clusters": 1, "linked_documents": 3}
+    announce(stats)
