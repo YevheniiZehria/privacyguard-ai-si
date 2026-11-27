@@ -51,7 +51,7 @@ text: you only receive opaque ids (doc_*, det_*, res_*), counts, scores and bool
 For EVERY input file:
   1. ocr_document(file_path=<alias such as FILE_1>)
   2. detect_pii(doc_id)
-  3. redact_image(doc_id, detection_id)
+  3. redact_image(doc_id, detection_id)  — omit padding_px so the safe default (4 px) is used
   4. verify_redaction(result_id). If status is FAIL, call redact_image again with a larger padding_px
      (e.g. 10) and verify again (at most once more).
 After all files are processed call link_documents() once.
@@ -149,18 +149,22 @@ class Stats:
         self.data = {"documents_processed": 0, "boxes_redacted": 0, "verified_pass": 0, "verified_fail": 0,
                      "clusters": 0, "linked_documents": 0, "tool_errors": 0, "status": "completed"}
         self._latest_boxes: dict[str, int] = {}
+        self._verify: dict[str, bool] = {}
 
     def record(self, name: str, args: dict, payload: dict) -> None:
         if "error" in payload:
             self.data["tool_errors"] += 1
             return
         if name == "ocr_document":
-            self.data["documents_processed"] += 1
+            self._latest_boxes.setdefault("doc:" + payload.get("doc_id", ""), 0)
+            self.data["documents_processed"] = sum(1 for k in self._latest_boxes if k.startswith("doc:"))
         elif name == "redact_image":
-            self._latest_boxes[args.get("doc_id", "")] = payload.get("boxes_drawn", 0)
-            self.data["boxes_redacted"] = sum(self._latest_boxes.values())
+            self._latest_boxes["red:" + args.get("doc_id", "")] = payload.get("boxes_drawn", 0)
+            self.data["boxes_redacted"] = sum(v for k, v in self._latest_boxes.items() if k.startswith("red:"))
         elif name == "verify_redaction":
-            self.data["verified_pass" if payload.get("verified") else "verified_fail"] += 1
+            self._verify[payload.get("result_id", "")] = bool(payload.get("verified"))
+            self.data["verified_pass"] = sum(self._verify.values())
+            self.data["verified_fail"] = len(self._verify) - self.data["verified_pass"]
         elif name == "link_documents":
             self.data["clusters"] = len(payload.get("clusters", []))
             self.data["linked_documents"] = sum(len(c["doc_ids"]) for c in payload.get("clusters", []))
@@ -178,8 +182,10 @@ async def run_agent(task: str, files: list[str], provider: str, model: str | Non
         if not base_url or not model or not api_key:
             print("LLM_BASE_URL / LLM_MODEL / LLM_API_KEY missing — see .env.example", file=sys.stderr)
             return 2
-        llm = AsyncOpenAI(base_url=base_url, api_key=api_key, max_retries=0,
-                          timeout=float(os.getenv("LLM_TIMEOUT_S", "60")))
+        # Local CPU models need a long first call while the model is loaded into memory
+        is_local = any(h in base_url for h in ("localhost", "127.0.0.1"))
+        timeout = float(os.getenv("LLM_TIMEOUT_S") or (300 if is_local else 60))
+        llm = AsyncOpenAI(base_url=base_url, api_key=api_key, max_retries=0, timeout=timeout)
     max_retries = int(os.getenv("LLM_MAX_RETRIES", "5"))
 
     aliases = {f"FILE_{i + 1}": str(Path(f).resolve()) for i, f in enumerate(files)}
@@ -192,6 +198,20 @@ async def run_agent(task: str, files: list[str], provider: str, model: str | Non
         tools = to_openai_tools((await mcp_client.list_tools()).tools)
         user_msg = task + "\n\nInput files (aliases): " + (", ".join(aliases) if aliases else "none")
         messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_msg}]
+        # Workflow tracker (ids only): lets the agent catch skipped steps and duplicate work by small models
+        ocr_cache: dict[str, dict] = {}          # alias -> ocr payload
+        result_doc: dict[str, str] = {}          # result_id -> doc_id
+        verified_docs: set[str] = set()
+        linked_after_last_doc = False
+        nudges = 0
+
+        def pending_work() -> list[str]:
+            todo = [f"{a}: not processed yet (call ocr_document)" for a in aliases if a not in ocr_cache]
+            todo += [f"{p['doc_id']}: redaction not verified yet" for p in ocr_cache.values()
+                     if p["doc_id"] not in verified_docs]
+            if len(ocr_cache) >= 2 and not linked_after_last_doc:
+                todo.append("link_documents has not been called after the last document")
+            return todo
 
         for step in range(1, max_steps + 1):
             try:
@@ -211,6 +231,14 @@ async def run_agent(task: str, files: list[str], provider: str, model: str | Non
             messages.append(assistant)
 
             if not msg.tool_calls:
+                todo = pending_work()
+                if todo and nudges < 3:
+                    nudges += 1
+                    print(f"  ! workflow incomplete, nudging the model ({nudges}/3): {len(todo)} item(s) pending",
+                          file=sys.stderr)
+                    messages.append({"role": "user", "content": "Do not ask questions; continue autonomously. "
+                                     "Still pending:\n- " + "\n- ".join(todo)})
+                    continue
                 print("\n=== Agent report ===\n" + (msg.content or "(empty)"))
                 break
 
@@ -224,7 +252,23 @@ async def run_agent(task: str, files: list[str], provider: str, model: str | Non
                         if alias not in aliases:
                             raise ValueError(f"Unknown file alias '{alias}'. Use one of {list(aliases)}")
                         real_args["file_path"] = aliases[alias]
-                    payload = tool_payload(await mcp_client.call_tool(name, real_args))
+                    if name == "ocr_document" and args["file_path"] in ocr_cache:
+                        # never index the same file twice (a duplicate would falsely "link" to itself)
+                        payload = dict(ocr_cache[args["file_path"]])
+                        payload["status"] = "indexed"
+                    else:
+                        payload = tool_payload(await mcp_client.call_tool(name, real_args))
+                    if "error" not in payload:
+                        if name == "ocr_document":
+                            if args["file_path"] not in ocr_cache:
+                                linked_after_last_doc = False
+                            ocr_cache[args["file_path"]] = payload
+                        elif name == "redact_image":
+                            result_doc[payload["result_id"]] = args.get("doc_id", "")
+                        elif name == "verify_redaction" and payload.get("verified"):
+                            verified_docs.add(result_doc.get(payload["result_id"], ""))
+                        elif name == "link_documents":
+                            linked_after_last_doc = True
                 except json.JSONDecodeError:
                     args, payload = {}, {"error": "Arguments were not valid JSON.", "tool": name}
                 except Exception as exc:   # MCP / transport / validation errors -> back to the LLM

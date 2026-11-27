@@ -108,3 +108,40 @@ def test_privacy_guard_blocks_raw_values():
     assert privacy_guard({"doc_id": "doc_1", "summary": {"CNP": 1}}) == []
     assert privacy_guard({"text": "Ion Popescu"})
     assert privacy_guard({"doc_id": "1960523331234"})
+
+
+class LazyLLM:
+    """Small-model behaviour: indexes FILE_1 twice, then stops and asks a question instead of linking."""
+
+    def __init__(self):
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+        self.turn = 0
+        self.nudged = False
+        self.doc_ids = []
+
+    async def create(self, messages, **_):
+        self.turn += 1
+        tool_msgs = [json.loads(m["content"]) for m in messages if m["role"] == "tool"]
+        self.doc_ids = [t["doc_id"] for t in tool_msgs if t.get("status") == "indexed"]
+        if messages[-1]["role"] == "user" and "Still pending" in messages[-1]["content"]:
+            self.nudged = True
+            return _msg(calls=[("link_documents", {})])
+        if self.turn == 1:
+            return _msg(calls=[("ocr_document", {"file_path": "FILE_1"}), ("ocr_document", {"file_path": "FILE_1"})])
+        if self.turn == 2:
+            return _msg(calls=[("ocr_document", {"file_path": "FILE_2"})])
+        if self.turn == 3:
+            return _msg(content="Would you like me to link the documents?")
+        return _msg(content="Done.")
+
+
+def test_duplicate_ocr_is_cached_and_skipped_steps_are_nudged(sample_image, tmp_path):
+    path, _ = sample_image
+    from PIL import Image
+    second = tmp_path / "second.png"
+    Image.open(path).save(second)
+    llm = LazyLLM()
+    asyncio.run(run_agent("x", [path, str(second)], "env", "fake", max_steps=10, tts=False, verbose=False, llm=llm))
+    assert llm.doc_ids[0] == llm.doc_ids[1]          # FILE_1 twice -> same doc_id, no duplicate in the vault
+    assert len(set(llm.doc_ids)) == 2
+    assert llm.nudged                                 # the agent pushed the model to finish the workflow

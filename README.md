@@ -151,6 +151,15 @@ timeouts and connection errors; malformed tool arguments, unknown aliases and MC
 the LLM as structured `{"error": ..., "tool": ...}` tool messages so it can recover. MCP JSON schemas are cleaned
 (`anyOf[null]`, `title`, `default`) for strict providers such as Gemini.
 
+**Workflow guardrail (for small local models):** the agent tracks the workflow by id only. Indexing the
+same file alias twice returns the cached `doc_id` (no duplicate document that would falsely link to itself),
+and if the model stops early — e.g. asks *"Would you like me to link the documents?"* — the agent lists the
+pending steps (unprocessed files, unverified redactions, missing `link_documents`) and lets it continue (max 3 nudges).
+
+**Tested with a real local model:** `qwen2.5:7b` via Ollama on CPU, all 12 synthetic documents: 12 OCR /
+detect / redact / verify calls, 12/12 PASS, `link_documents` → 4 clusters covering all 12 documents
+(one nudge was needed), ~7 minutes end to end.
+
 **TTS:** at the end of every run `agent/tts_notifier.py` speaks e.g. *"Task completed. 12 documents processed,
 92 PII regions redacted. Verification: 12 passed, 0 failed. 4 document link groups found, covering 12 documents."*
 using `pyttsx3` (Windows SAPI5, offline, CPU) with a `piper` CLI fallback (`PIPER_EXE`, `PIPER_VOICE`).
