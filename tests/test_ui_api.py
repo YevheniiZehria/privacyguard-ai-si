@@ -1,4 +1,4 @@
-"""Web dashboard API tests (direct mode; requires Tesseract)."""
+"""Web terminal API tests: login, folders on disk, automatic redaction (requires Tesseract)."""
 import io
 import json
 import re
@@ -12,77 +12,152 @@ from PIL import Image, ImageDraw, ImageFont
 from server.pii_detector import cnp_control_digit
 from ui import api as ui_api
 
+CNP = "296101233123" + cnp_control_digit("296101233123")
+
 
 @pytest.fixture
-def client():
+def anon(tmp_path, monkeypatch):
+    monkeypatch.setattr(ui_api, "STORE", ui_api.Store(tmp_path / "ws"))
     with TestClient(ui_api.app) as c:
-        c.post("/api/reset")
         yield c
-        c.post("/api/reset")
 
 
-def _doc_png(cnp: str) -> bytes:
+@pytest.fixture
+def client(anon):
+    r = anon.post("/api/login", json={"username": ui_api.UI_USERNAME, "passphrase": ui_api.UI_PASSPHRASE})
+    assert r.status_code == 200
+    return anon
+
+
+def _doc_image() -> Image.Image:
     img = Image.new("RGB", (1500, 260), "white")
     d = ImageDraw.Draw(img)
     f = ImageFont.truetype("arial.ttf", 34)
-    d.text((40, 40), f"Subsemnata Ionescu Maria Elena, CNP {cnp}", fill="black", font=f)
+    d.text((40, 40), f"Subsemnata Ionescu Maria Elena, CNP {CNP}", fill="black", font=f)
     d.text((40, 130), "domiciliata in Str. Florilor nr. 3, Iasi", fill="black", font=f)
+    return img
+
+
+def _png() -> bytes:
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    _doc_image().save(buf, format="PNG")
     return buf.getvalue()
 
 
-def _wait_for_job(c, timeout=120):
+def _pdf_two_pages() -> bytes:
+    buf = io.BytesIO()
+    a, b = _doc_image(), _doc_image()
+    a.save(buf, "PDF", save_all=True, append_images=[b], resolution=300)   # renders back at 1500 px wide
+    return buf.getvalue()
+
+
+def _wait_idle(c, folder_id, timeout=180):
     t0 = time.time()
     while time.time() - t0 < timeout:
-        st = c.get("/api/state").json()
-        if not st["job"]["running"]:
-            return st
-        time.sleep(0.5)
-    raise AssertionError("job did not finish")
+        docs = c.get(f"/api/folders/{folder_id}/documents").json()["documents"]
+        if docs and not any(d["status"] in ("QUEUED", "SCANNING") for d in docs):
+            return docs
+        time.sleep(0.4)
+    raise AssertionError("documents were not processed in time")
 
 
-def test_upload_process_download_reset(client):
-    cnp = "296101233123" + cnp_control_digit("296101233123")
-    r = client.post("/api/upload", files=[("files", ("scan one.png", _doc_png(cnp), "image/png")),
-                                          ("files", ("scan two.png", _doc_png(cnp), "image/png"))])
+# ----------------------------------------------------------------------------- auth
+def test_login_logout_and_protection(anon):
+    assert anon.get("/api/session").json() == {"authenticated": False, "username": None}
+    assert anon.get("/api/folders").status_code == 401
+    assert anon.post("/api/folders", json={"name": "x"}).status_code == 401
+    bad = anon.post("/api/login", json={"username": ui_api.UI_USERNAME, "passphrase": "wrong"})
+    assert bad.status_code == 401 and "pg_session" not in bad.cookies
+
+    r = anon.post("/api/login", json={"username": ui_api.UI_USERNAME, "passphrase": ui_api.UI_PASSPHRASE})
+    assert r.status_code == 200 and r.json()["token"]
+    assert "httponly" in r.headers["set-cookie"].lower()
+    assert anon.get("/api/session").json()["authenticated"] is True
+    assert anon.get("/api/folders").status_code == 200
+
+    token = r.json()["token"]                      # bearer works too (cookie-less clients)
+    fresh = TestClient(ui_api.app)
+    assert fresh.get("/api/folders", headers={"Authorization": f"Bearer {token}"}).status_code == 200
+
+    assert anon.post("/api/logout").status_code == 200
+    assert fresh.get("/api/folders", headers={"Authorization": f"Bearer {token}"}).status_code == 401
+
+
+# ----------------------------------------------------------------------------- folders
+def test_folder_crud_persists_on_disk(client):
+    f = client.post("/api/folders", json={"name": "  Client_Set_01 "}).json()
+    assert re.fullmatch(r"f_[0-9a-f]{8}", f["folder_id"]) and f["name"] == "Client_Set_01"
+    meta_path = ui_api.STORE.root / f["folder_id"] / "metadata.json"
+    assert json.loads(meta_path.read_text())["name"] == "Client_Set_01"
+
+    listed = client.get("/api/folders").json()["folders"]
+    assert [x["folder_id"] for x in listed] == [f["folder_id"]] and listed[0]["document_count"] == 0
+
+    # a new Store over the same directory sees the folder (survives a restart)
+    assert ui_api.Store(ui_api.STORE.root).list()[0]["name"] == "Client_Set_01"
+
+    assert client.post("/api/folders", json={"name": "   "}).status_code == 422
+    assert client.delete(f"/api/folders/{f['folder_id']}").status_code == 200
+    assert not meta_path.parent.exists()
+    assert client.get("/api/folders").json()["folders"] == []
+
+
+def test_upload_redacts_automatically(client):
+    f = client.post("/api/folders", json={"name": "Contracts"}).json()
+    fid = f["folder_id"]
+    r = client.post(f"/api/folders/{fid}/upload", files=[("files", ("scan one.png", _png(), "image/png")),
+                                                         ("files", ("scan one.png", _png(), "image/png"))])
     assert r.status_code == 200
     added = r.json()["added"]
-    assert len(added) == 2 and "path" not in added[0]          # absolute paths never reach the page
+    assert len(added) == 2 and all(d["status"] == "QUEUED" for d in added)
+    assert "stored" not in added[0] and "pipeline_doc_id" not in added[0]       # no disk paths / internal ids
 
-    assert client.post("/api/process", json={"mode": "direct", "padding_px": 6}).status_code == 200
-    st = _wait_for_job(client)
-    files = st["files"]
-    assert all(f["status"] == "VERIFIED PASS" for f in files)
-    assert all(f["summary"]["CNP"] == 1 and f["has_after"] for f in files)
-    assert st["links"]["clusters"] and len(st["links"]["clusters"][0]["doc_ids"]) == 2
+    docs = _wait_idle(client, fid)
+    assert all(d["status"] == "BLURRED" and d["boxes_drawn"] >= 1 and d["residual_pii_count"] == 0 for d in docs)
 
-    # every event that crossed the boundary is free of raw PII
-    blob = json.dumps(st["events"]) + json.dumps(st["files"]) + json.dumps(st["links"])
-    assert cnp not in blob and "Ionescu" not in blob and "Florilor" not in blob
-    tool_events = [e for e in st["events"] if e["type"] == "tool"]
-    assert len(tool_events) == 9 and all(e["pii_pattern_hits"] == 0 for e in tool_events)
+    did = docs[0]["doc_id"]
+    for kind in ("original", "blurred"):
+        img = client.get(f"/api/folders/{fid}/documents/{did}/image/{kind}")
+        assert img.status_code == 200 and img.headers["content-type"] == "image/png"
+    dl = client.get(f"/api/folders/{fid}/documents/{did}/download")
+    assert dl.headers["content-type"] == "image/png" and "scan_one_blurred.png" in dl.headers["content-disposition"]
 
-    fid = files[0]["file_id"]
-    assert client.get(f"/api/image/{fid}/before").headers["content-type"] == "image/png"
-    assert client.get(f"/api/image/{fid}/after").status_code == 200
-    assert "attachment" in client.get(f"/api/download/{fid}").headers["content-disposition"]
-    z = zipfile.ZipFile(io.BytesIO(client.get("/api/download-all").content))
-    names = z.namelist()
-    assert "manifest.json" in names and sum(n.endswith(".png") for n in names) == 2
-    assert cnp not in z.read("manifest.json").decode()
+    z = zipfile.ZipFile(io.BytesIO(client.get(f"/api/folders/{fid}/download-all").content))
+    assert sorted(z.namelist()) == ["scan_one_blurred.png", "scan_one_blurred_2.png"]   # duplicate names deduped
 
-    uploaded = [ui_api.STATE.files[f["file_id"]].path for f in files]
-    assert client.post("/api/reset").status_code == 200
-    assert not any(__import__("os").path.exists(p) for p in uploaded)   # uploads are deleted on reset
+    # raw PII never lands in metadata or API responses
+    blob = (ui_api.STORE.root / fid / "metadata.json").read_text() + json.dumps(client.get("/api/folders").json()) \
+        + json.dumps(client.get(f"/api/folders/{fid}/documents").json())
+    assert CNP not in blob and "Ionescu" not in blob and "Florilor" not in blob
+
+    hub = client.get("/api/folders").json()["folders"][0]
+    assert hub["document_count"] == 2 and hub["blurred_count"] == 2
+
+    assert client.delete(f"/api/folders/{fid}/documents/{did}").status_code == 200
+    assert len(client.get(f"/api/folders/{fid}/documents").json()["documents"]) == 1
 
 
-def test_rejects_bad_uploads_and_unknown_ids(client):
-    r = client.post("/api/upload", files=[("files", ("evil.exe", b"MZ", "application/octet-stream"))])
-    assert r.status_code == 400
-    assert client.get("/api/image/nope/after").status_code == 404
-    assert client.post("/api/process", json={"mode": "direct"}).status_code == 400      # empty queue
-    assert client.post("/api/process", json={"mode": "direct", "padding_px": 99}).status_code == 422
+def test_multipage_pdf_downloads_as_pdf(client):
+    fid = client.post("/api/folders", json={"name": "PDFs"}).json()["folder_id"]
+    client.post(f"/api/folders/{fid}/upload", files=[("files", ("two pages.pdf", _pdf_two_pages(), "application/pdf"))])
+    doc = _wait_idle(client, fid)[0]
+    assert doc["status"] == "BLURRED" and doc["page_count"] == 2
+    assert client.get(f"/api/folders/{fid}/documents/{doc['doc_id']}/image/blurred?page=2").status_code == 200
+    assert client.get(f"/api/folders/{fid}/documents/{doc['doc_id']}/image/blurred?page=3").status_code == 404
+    dl = client.get(f"/api/folders/{fid}/documents/{doc['doc_id']}/download")
+    assert dl.headers["content-type"] == "application/pdf" and dl.content.startswith(b"%PDF")
+
+
+def test_rejects_bad_input(client):
+    fid = client.post("/api/folders", json={"name": "Inbox"}).json()["folder_id"]
+    assert client.post(f"/api/folders/{fid}/upload",
+                       files=[("files", ("evil.exe", b"MZ", "application/octet-stream"))]).status_code == 400
+    assert not list((ui_api.STORE.root / fid / "original").iterdir())         # nothing written
+    assert client.get("/api/folders/../../etc/documents").status_code == 404
+    assert client.get("/api/folders/f_00000000/documents").status_code == 404
+    assert client.get(f"/api/folders/{fid}/documents/d_0000000000/download").status_code == 404
+    assert client.get(f"/api/folders/{fid}/documents/nope/image/original").status_code == 404
+    assert client.get(f"/api/folders/{fid}/download-all").status_code == 404   # nothing redacted yet
 
 
 def test_safe_upload_names():
@@ -90,47 +165,6 @@ def test_safe_upload_names():
     assert re.fullmatch(r"[A-Za-z0-9._-]+", ui_api._safe_name("Buletin Ion Popescu (1).png"))
 
 
-def test_full_blur_folder_autoruns(client):
-    cnp = "296101233123" + cnp_control_digit("296101233123")
-    fo = client.post("/api/folders", json={"name": "Contracts", "policy": "full", "auto": True}).json()
-    assert fo["policy"] == "full" and fo["auto"] is True
-    r = client.post("/api/upload", data={"folder_id": fo["folder_id"]},
-                    files=[("files", ("contract.png", _doc_png(cnp), "image/png"))])
-    assert r.status_code == 200 and r.json()["auto"] is True        # processing starts without /api/process
-    time.sleep(0.2)
-    st = _wait_for_job(client)
-    f = st["files"][0]
-    assert f["folder_id"] == fo["folder_id"]
-    assert f["status"] == "VERIFIED PASS" and f["has_after"] and f["residual_pii_count"] == 0
-    assert [e["tool"] for e in st["events"] if e["type"] == "tool"] == ["blur_document", "verify_redaction"]
-    blob = json.dumps(st)
-    assert cnp not in blob and "Ionescu" not in blob
-
-    z = zipfile.ZipFile(io.BytesIO(client.get(f"/api/download-all?folder_id={fo['folder_id']}").content))
-    assert sum(n.endswith(".png") for n in z.namelist()) == 1
-
-    assert client.patch(f"/api/folders/{fo['folder_id']}", json={"name": "Archive", "policy": "pii"}).json()["policy"] == "pii"
-    path = ui_api.STATE.files[f["file_id"]].path
-    assert client.delete(f"/api/folders/{fo['folder_id']}").status_code == 200
-    assert not __import__("os").path.exists(path) and not client.get("/api/state").json()["files"]
-
-
-def test_folder_rules(client):
-    assert client.delete(f"/api/folders/{ui_api.INBOX_ID}").status_code == 400
-    assert client.delete("/api/folders/f_nope").status_code == 404
-    assert client.post("/api/upload", data={"folder_id": "f_nope"},
-                       files=[("files", ("a.png", b"x", "image/png"))]).status_code == 404
-    assert client.post("/api/folders", json={"name": ""}).status_code == 422
-    fo = client.post("/api/folders", json={"name": "Manual", "policy": "pii", "auto": False}).json()
-    assert client.post("/api/process", json={"folder_id": fo["folder_id"]}).status_code == 400   # empty folder
-    names = [f["name"] for f in client.get("/api/state").json()["folders"]]
-    assert names == ["INBOX", "Manual"]
-    client.post("/api/reset")
-    assert [f["name"] for f in client.get("/api/state").json()["folders"]] == ["INBOX"]
-
-
-def test_index_and_config(client):
-    assert "PrivacyGuard" in client.get("/").text
-    cfg = client.get("/api/config").json()
-    assert cfg["providers"]["direct"]["available"] is True
-    assert set(cfg["pii_types"]) >= {"CNP", "MRZ"}
+def test_index_is_public(anon):
+    page = anon.get("/").text
+    assert "PrivacyGuard" in page and "AUTHENTICATE_SESSION" in page

@@ -25,6 +25,7 @@ vault/
 WhatsApp*
 private_samples/
 ui/uploads/
+workspace_folders/
 
 # OS / IDE
 .DS_Store

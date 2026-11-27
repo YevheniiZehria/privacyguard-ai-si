@@ -3,172 +3,125 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PrivacyGuard AI — document redaction</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%23090B0E'/><path d='M8 11l6 5-6 5' stroke='%2300FF9D' stroke-width='3' fill='none'/><rect x='16' y='19' width='9' height='3' fill='%2300FF9D'/></svg>">
+  <title>PrivacyGuard AI — terminal</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%23000'/><path d='M8 10l6 6-6 6' stroke='%23fff' stroke-width='3' fill='none'/><rect x='16' y='20' width='9' height='3' fill='%23fff'/></svg>">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-<div class="app">
 
-  <!-- ============ TOP BAR ============ -->
-  <header class="topbar">
-    <div class="brand"><span class="prompt">&gt;</span>privacyguard<span class="cursor">_</span></div>
-    <span class="tag tag-dim">local · 127.0.0.1</span>
-    <div class="grow"></div>
-    <label class="field-inline mono" title="Engine used for PII-ONLY folders. FULL BLUR folders never need an LLM.">
-      <span class="muted">engine</span>
-      <select id="modeSelect" class="select">
-        <option value="direct">direct pipeline</option>
-        <option value="ollama">ollama · qwen2.5:7b</option>
-        <option value="gemini">gemini cloud</option>
-      </select>
+<!-- ================= STEP 1 · LOGIN ================= -->
+<main id="viewLogin" class="view view-login hidden">
+  <form id="loginForm" class="login-box" autocomplete="on">
+    <div class="login-top mono dim">PRIVACYGUARD // TERMINAL v2</div>
+    <h1 class="mono login-title"><span id="loginType" data-text="> AUTHENTICATE_SESSION"></span><span class="cursor">_</span></h1>
+    <p class="desc">Local document redaction console. Nothing leaves this machine.</p>
+
+    <label class="field">
+      <span class="field-label mono">username</span>
+      <span class="field-row"><span class="mono dim">$</span>
+        <input id="loginUser" name="username" class="input mono" autocomplete="username" spellcheck="false" required></span>
     </label>
-    <div id="jobPill" class="pill pill-idle"><span class="dot"></span><span id="jobText">idle</span></div>
-  </header>
+    <label class="field">
+      <span class="field-label mono">access passphrase</span>
+      <span class="field-row"><span class="mono dim">#</span>
+        <input id="loginPass" name="password" type="password" class="input mono" autocomplete="current-password" required></span>
+    </label>
 
-  <!-- ============ SIDEBAR: FOLDERS ============ -->
-  <aside class="sidebar">
-    <div class="section-h">
-      <span>// folders</span>
-      <button id="newFolderBtn" class="icon-btn" title="New folder">+</button>
+    <div id="loginError" class="login-error mono hidden"></div>
+    <button type="submit" class="btn btn-primary btn-block" data-scramble>[ ENTER ]</button>
+  </form>
+</main>
+
+<!-- ================= TOP BAR (hub + dashboard) ================= -->
+<header id="topbar" class="topbar hidden">
+  <a href="#/folders" class="logo mono">PRIVACYGUARD <span class="dim">//</span> TERMINAL<span class="cursor">_</span></a>
+  <div class="grow"></div>
+  <span id="whoami" class="mono dim small"></span>
+  <button id="logoutBtn" class="btn btn-ghost btn-sm" data-scramble>[ LOGOUT ]</button>
+</header>
+
+<!-- ================= STEP 2 · FOLDER HUB ================= -->
+<main id="viewHub" class="view view-hub hidden">
+  <section class="hub">
+    <div class="hub-head">
+      <div class="mono dim small">~/workspace</div>
+      <h1 class="mono h1"><span id="hubType" data-text="DOCUMENT SETS"></span><span class="cursor">_</span></h1>
+      <p class="desc">Each folder is a document set. Everything dropped into it is redacted automatically.</p>
     </div>
 
-    <form id="newFolderForm" class="new-folder hidden" autocomplete="off">
-      <input id="newFolderName" class="input" maxlength="48" placeholder="folder name" required>
-      <div class="seg seg-full" id="newFolderPolicy">
-        <button type="button" data-policy="full" class="seg-btn active">FULL BLUR</button>
-        <button type="button" data-policy="pii" class="seg-btn">PII ONLY</button>
-      </div>
-      <div class="row gap">
-        <button type="submit" class="btn btn-primary grow">create</button>
-        <button type="button" id="newFolderCancel" class="btn">esc</button>
-      </div>
+    <button id="createFolderBtn" class="btn btn-primary btn-lg" data-scramble>[ + CREATE FOLDER ]</button>
+    <form id="createFolderForm" class="create-form hidden" autocomplete="off">
+      <span class="mono dim">mkdir</span>
+      <input id="folderNameInput" class="input mono" maxlength="64" placeholder="Client_Set_01" spellcheck="false" required>
+      <button type="submit" class="btn btn-primary btn-sm">CREATE</button>
+      <button type="button" id="createFolderCancel" class="btn btn-ghost btn-sm">ESC</button>
     </form>
 
-    <ul id="folderList" class="folder-list"></ul>
+    <div class="list-label mono dim small"><span id="folderCount">0 folders</span></div>
+    <ul id="folderGrid" class="folder-grid"></ul>
+  </section>
+</main>
 
-    <details class="settings">
-      <summary>// settings</summary>
-      <div class="settings-body">
-        <div>
-          <div class="row between"><span class="muted">padding</span><span class="mono accent" id="padVal">4px</span></div>
-          <input id="padding" type="range" min="0" max="12" value="4" class="range">
-        </div>
-        <label class="check"><input id="slm" type="checkbox"> local SLM for names / addresses</label>
-        <label class="check"><input id="tts" type="checkbox"> spoken summary (offline TTS)</label>
-        <p id="providerNote" class="note hidden"></p>
+<!-- ================= STEP 3 · FOLDER DASHBOARD ================= -->
+<main id="viewFolder" class="view view-folder hidden">
+  <section class="dash">
+    <div class="dash-head">
+      <div>
+        <a href="#/folders" class="crumb mono">← BACK TO FOLDERS</a>
+        <h1 class="mono h1"><span id="folderTitle" data-scramble-text></span><span class="cursor">_</span></h1>
+        <div id="folderMeta" class="mono dim small"></div>
       </div>
-    </details>
-  </aside>
-
-  <!-- ============ DOCUMENTS ============ -->
-  <section class="docs panel">
-    <div class="folder-head">
-      <div class="row gap">
-        <input id="folderName" class="title-input" maxlength="48" spellcheck="false" aria-label="Folder name">
-        <span id="folderId" class="mono dim small"></span>
-      </div>
-      <div class="row gap wrap">
-        <div class="seg" id="policySeg" title="What happens to every document in this folder">
-          <button data-policy="full" class="seg-btn">FULL BLUR</button>
-          <button data-policy="pii" class="seg-btn">PII ONLY</button>
-        </div>
-        <label class="switch" title="Process documents automatically as soon as they are added">
-          <input id="autoToggle" type="checkbox"><span class="track"></span><span class="mono small">auto</span>
-        </label>
-        <div class="grow"></div>
-        <button id="deleteFolderBtn" class="icon-btn icon-danger" title="Delete folder and its uploads">
-          <svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13" /></svg></button>
-      </div>
-      <div class="row gap">
-        <button id="runBtn" class="btn btn-primary grow">
-          <svg viewBox="0 0 24 24" class="fill"><path d="M8 5v14l11-7z"/></svg><span id="runLabel">run</span></button>
-        <a id="dlAll" class="btn disabled" href="#" title="Download every redacted page in this folder">
-          <svg viewBox="0 0 24 24"><path d="M12 4v11m0 0 4-4m-4 4-4-4M5 19h14"/></svg>.zip</a>
-      </div>
+      <a id="downloadAll" class="btn btn-primary disabled" href="#" data-scramble>[ DOWNLOAD ALL (.ZIP) ]</a>
     </div>
 
     <label id="dropZone" class="drop">
-      <input id="fileInput" type="file" multiple accept=".png,.jpg,.jpeg,.pdf" hidden>
-      <span class="mono">drop files</span><span class="dim"> or click · png jpg pdf</span>
-      <span id="dropHint" class="drop-hint mono"></span>
+      <input id="fileInput" type="file" multiple accept=".pdf,.png,.jpg,.jpeg" hidden>
+      <div class="drop-inner">
+        <div class="drop-icon mono">[ ↓ ]</div>
+        <div class="mono drop-title" id="dropTitle">DROP FILES TO REDACT</div>
+        <div class="desc">PDF · PNG · JPG — or click to browse. Sensitive data is blacked out automatically.</div>
+      </div>
+      <div class="laser"></div>
     </label>
-    <button id="demoBtn" class="link-btn mono hidden">+ load synthetic dataset</button>
 
-    <div class="list-h mono"><span id="docCount">0 docs</span><span id="linkCount" class="dim"></span></div>
-    <ul id="fileList" class="file-list"></ul>
+    <div class="table-wrap">
+      <table class="doc-table">
+        <thead class="mono">
+          <tr><th>FILE</th><th class="col-size">SIZE</th><th class="col-status">STATUS</th><th class="col-actions"></th></tr>
+        </thead>
+        <tbody id="docRows"></tbody>
+      </table>
+      <div id="docEmpty" class="doc-empty mono dim">// no documents yet</div>
+    </div>
   </section>
+</main>
 
-  <!-- ============ VIEWER ============ -->
-  <section class="viewer-panel panel">
-    <div class="viewer-head">
-      <span id="inspTitle" class="mono truncate">no document</span>
+<!-- ================= PREVIEW MODAL ================= -->
+<div id="preview" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="previewTitle">
+  <div class="modal-box">
+    <div class="modal-head">
+      <span id="previewTitle" class="mono truncate"></span>
       <div class="grow"></div>
-      <div class="seg seg-sm" id="viewSeg">
-        <button data-view="curtain" class="seg-btn active">curtain</button>
-        <button data-view="split" class="seg-btn">split</button>
+      <div class="seg mono" id="previewSeg">
+        <button data-mode="original">ORIGINAL</button>
+        <button data-mode="blurred" class="active">BLURRED</button>
+        <button data-mode="split">SIDE-BY-SIDE</button>
       </div>
-      <div class="row">
-        <button class="icon-btn" id="zoomOut" title="Zoom out">−</button>
-        <span class="mono small zoom-val" id="zoomVal">100%</span>
-        <button class="icon-btn" id="zoomIn" title="Zoom in">+</button>
-        <button class="icon-btn" id="zoomFit" title="Fit (f)">⤢</button>
+      <div id="pager" class="pager mono hidden">
+        <button id="pagePrev" class="btn btn-ghost btn-sm">‹</button>
+        <span id="pageLabel">1/1</span>
+        <button id="pageNext" class="btn btn-ghost btn-sm">›</button>
       </div>
-      <label class="switch" title="Blur the original — useful when sharing your screen">
-        <input id="privacyScreen" type="checkbox"><span class="track"></span><span class="mono small">privacy</span>
-      </label>
+      <button id="previewClose" class="btn btn-ghost btn-sm" title="Close (Esc)">✕</button>
     </div>
-
-    <div id="viewer" class="viewer">
-      <div id="emptyState" class="empty">
-        <pre class="mono dim">  ┌──────────────┐
-  │ ████  ██████ │
-  │ ██████  ████ │
-  │ ████████  ██ │
-  └──────────────┘</pre>
-        <div class="mono">select a document</div>
-        <div class="dim small">create a folder, drop scans in it — they are redacted automatically.</div>
-      </div>
-      <div id="curtain" class="fill-abs hidden">
-        <div class="layer" id="layerBefore"><div class="stage"><img id="imgBefore" alt="Original" draggable="false"></div></div>
-        <div class="layer" id="layerAfter"><div class="stage"><img id="imgAfter" alt="Redacted" draggable="false"></div></div>
-        <div id="divider" class="divider"><div class="divider-knob">⟷</div></div>
-        <span class="corner corner-l">ORIGINAL</span><span class="corner corner-r">REDACTED</span>
-      </div>
-      <div id="split" class="fill-abs split hidden">
-        <div class="layer-box"><div class="stage"><img id="imgBefore2" alt="Original" draggable="false"></div><span class="corner corner-l">ORIGINAL</span></div>
-        <div class="layer-box"><div class="stage"><img id="imgAfter2" alt="Redacted" draggable="false"></div><span class="corner corner-r">REDACTED</span></div>
-      </div>
-      <div id="pendingAfter" class="pending mono hidden">redacted output not produced yet</div>
+    <div id="previewBody" class="modal-body mode-blurred">
+      <figure class="pane pane-original"><figcaption class="mono">ORIGINAL</figcaption><img id="imgOriginal" alt="Original document"></figure>
+      <figure class="pane pane-blurred"><figcaption class="mono">BLURRED</figcaption><img id="imgBlurred" alt="Redacted document"></figure>
     </div>
-
-    <div class="status-line mono">
-      <span id="verifyBadge" class="badge b-queued">NOT VERIFIED</span>
-      <span class="kv"><span class="dim">residual</span> <b id="sResidual">—</b></span>
-      <span class="kv"><span class="dim">doc_id</span> <b id="sDoc">—</b></span>
-      <div class="grow"></div>
-      <a id="dlOne" class="btn btn-sm disabled" href="#" download>
-        <svg viewBox="0 0 24 24"><path d="M12 4v11m0 0 4-4m-4 4-4-4M5 19h14"/></svg>png</a>
-    </div>
-  </section>
-
-  <!-- ============ LOG DRAWER ============ -->
-  <section id="logPanel" class="log panel collapsed">
-    <div class="log-head mono" id="logHead">
-      <span class="caret">▸</span><span>// log</span>
-      <span id="logLast" class="dim truncate grow"></span>
-      <span id="leakBadge" class="badge b-pass" title="Raw-PII patterns (CNP, e-mail, IBAN, ID series) found in anything that crossed the MCP/LLM boundary">0 raw PII out</span>
-      <div class="seg seg-sm" id="logSeg">
-        <button data-filter="all" class="seg-btn active">all</button>
-        <button data-filter="tool" class="seg-btn">tools</button>
-      </div>
-      <button class="icon-btn" id="clearLog" title="Clear log">⌫</button>
-    </div>
-    <div id="console" class="console mono"></div>
-  </section>
+  </div>
 </div>
 
-<div id="toast" class="toast hidden"></div>
+<div id="toast" class="toast mono hidden"></div>
 <script src="/static/app.js"></script>
 </body>
 </html>

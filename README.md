@@ -173,22 +173,26 @@ python -m ui.api                 # opens http://127.0.0.1:8000
 python -m ui.api --port 8010 --no-browser
 ```
 
-A dark-mode dashboard (FastAPI backend in `ui/api.py`, vanilla JS + Tailwind CDN + Cytoscape.js frontend in
-`ui/static/`, no build step) that sits on top of the same pipeline and agent:
+A black & white terminal-style web app (FastAPI backend in `ui/api.py`, vanilla HTML/CSS/JS in `ui/static/`,
+no build step, no CDN) on top of the same pipeline:
 
-| Panel | What it does |
-|---|---|
-| **Header** | Execution mode: **Direct Pipeline** (calls `server/pipeline.py` in-process, ~1.5 s/doc) or the **autonomous agent** with **Ollama (qwen2.5:7b)** or **Gemini** (spawns the MCP server over stdio). Live KPIs: documents, PII redacted, PASS/FAIL, clusters and **raw-PII hits sent to the LLM**. |
-| **Left — queue** | Drag & drop PNG/JPG/PDF, one-click **Load synthetic dataset (12 docs)**, status badges (`QUEUED → OCR DONE → PII DETECTED → REDACTED → VERIFIED PASS/FAIL`), opaque `doc_id`, pages, words; padding slider (0–12 px), local-SLM and TTS toggles. |
-| **Center — inspector** | Draggable **curtain** or **side-by-side** comparison of the deskewed original vs. `output/redacted_<doc_id>.png`, wheel zoom / drag pan / double-click to fit, a *privacy screen* that blurs the original for screen sharing, PII counters for all 9 types, OCR confidence, `verify_redaction` status, per-file PNG and **.zip** download (with an id-only `manifest.json`). |
-| **Right — links** | Cytoscape graph: one box per cluster, documents as nodes (thumbnail of the redacted page, green ring = PASS), edges labelled with shared entity types and confidence (e.g. `CNP+ID+NAME · 0.9999`). Click a cluster to highlight its documents. |
-| **Right — audit** | Live stream (Server-Sent Events) of every MCP tool call: `AGENT→MCP` arguments, `MCP→LLM` result and, expandable, **the exact text appended to the LLM conversation**, each scanned for raw CNP / e-mail / IBAN / ID-series patterns. In agent mode the task prompt is shown too: the LLM only sees `FILE_1…FILE_n`. |
+1. **Login** — username + access passphrase from `.env` (`UI_USERNAME`, `UI_PASSPHRASE`; local-dev defaults
+   `admin` / `privacyguard` — change them). Sessions are random tokens kept in memory (HttpOnly, SameSite=Lax cookie, 12 h; a server restart logs you out).
+2. **Folder hub** — create, open and delete document sets; each card shows creation time and `redacted/total`.
+3. **Folder dashboard** — drag & drop PDF/PNG/JPG files (or click to browse). Every file is queued and run through
+   `ocr_document → detect_pii → redact_image → verify_redaction` automatically by one background worker. Status goes
+   `[ QUEUED ] → [ SCANNING... ] → [ BLURRED ]` (`[ REVIEW ]` if the verification pass still finds PII-like text,
+   `[ ERROR ]` on failure). Per file: **Preview** (original / redacted / side-by-side, page stepper for PDFs) and
+   **Download** (PNG, or one PDF for multi-page documents); **Download all (.zip)** exports the whole folder.
 
-Privacy notes: the server binds to `127.0.0.1` only. Uploads go to `ui/uploads/` (git-ignored) and are deleted on
-*Reset* or when removed from the queue. Absolute paths are never sent to the page, and images are served only from
-`ui/uploads/`, `synthetic_data/` and `output/`. The original image is shown in your local browser only. The page
-loads Tailwind and Cytoscape from public CDNs (script files only; no document data goes there). The TTS summary
-runs in a separate process.
+Folders persist on disk in `workspace_folders/<folder_id>/` (git-ignored; override with `UI_WORKSPACE`):
+`metadata.json` (names, timestamps, statuses and counts only), `original/` (uploads) and `out/` (pipeline output).
+Deleting a folder removes all of it.
+
+Privacy notes: the server binds to `127.0.0.1` only and every API route except login requires a session. OCR text
+and PII values live only in the in-memory vault and are cleared after each document; nothing about them is written
+to `metadata.json` or sent to the page. Uploaded originals stay on disk until you delete the document or folder.
+The web app always uses the direct pipeline; the LLM agent remains available from the CLI.
 
 ## Evaluation
 
@@ -215,7 +219,7 @@ larger padding / flag for review). Real-world scans with other layouts will scor
 ```
 server/       MCP server, vault, OCR, PII detector, linker, redactor, pipeline
 agent/        CLI agent loop + offline TTS
-ui/           web dashboard: api.py (FastAPI + SSE) and static/ (index.html, app.js, styles.css)
+ui/           web terminal: api.py (FastAPI, login + folders) and static/ (index.html, app.js, styles.css)
 evaluation/   synthetic dataset generator, evaluation suite, results*.md
 synthetic_data/  12 generated documents + ground_truth.json
 tests/        unit tests, pipeline tests, agent-loop test with a scripted fake LLM, MCP smoke client
