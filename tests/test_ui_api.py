@@ -185,3 +185,158 @@ def test_safe_upload_names():
 def test_index_is_public(anon):
     page = anon.get("/").text
     assert "PrivacyGuard" in page and "AUTHENTICATE_SESSION" in page
+
+
+# ----------------------------------------------------------------------------- blur calibration
+def test_calibration_persists_and_is_inherited(client):
+    fid = client.post("/api/folders", json={"name": "Calib"}).json()["folder_id"]
+    got = client.get(f"/api/folders/{fid}/calibration").json()
+    assert got["calibration"] == {"blur_level": 7, "padding_px": 4, "mode": "blur"} and got["presets"]["maximum"] == 10
+
+    r = client.put(f"/api/folders/{fid}/calibration", json={"blur_level": 9, "padding_px": 12, "mode": "blur"})
+    assert r.status_code == 200
+    meta = json.loads((ui_api.STORE.root / fid / "metadata.json").read_text())
+    assert meta["calibration"] == {"blur_level": 9, "padding_px": 12, "mode": "blur"}
+    for bad in ({"blur_level": 11}, {"blur_level": 0}, {"padding_px": 30}, {"mode": "pixel"}):
+        assert client.put(f"/api/folders/{fid}/calibration", json=bad).status_code == 422
+
+    client.post(f"/api/folders/{fid}/upload", files=[("files", ("a.png", _png(), "image/png"))])
+    doc = _wait_idle(client, fid)[0]
+    assert doc["calibration"] == {"blur_level": 9, "padding_px": 12, "mode": "blur"}   # inherited by new uploads
+    assert doc["status"] == "BLURRED"
+
+
+def test_reapply_without_ocr_updates_preview_and_status(client, monkeypatch):
+    fid = client.post("/api/folders", json={"name": "Reapply"}).json()["folder_id"]
+    client.post(f"/api/folders/{fid}/upload", files=[("files", ("a.png", _png(), "image/png")),
+                                                     ("files", ("b.png", _png(), "image/png"))])
+    docs = _wait_idle(client, fid)
+    did = docs[0]["doc_id"]
+    meta = json.loads((ui_api.STORE.root / fid / "metadata.json").read_text())
+    pdoc = meta["documents"][0]["pipeline_doc_id"]
+    plan = ui_api.STORE.root / fid / "out" / "work" / f"{pdoc}_plan.json"
+    assert plan.is_file() and CNP not in plan.read_text() and "Ionescu" not in plan.read_text()
+    before = client.get(f"/api/folders/{fid}/documents/{did}/image/blurred").content
+
+    from server import pipeline as pl
+    def no_ocr(*_a, **_k):
+        raise AssertionError("re-apply must not run OCR again")
+    monkeypatch.setattr(pl.PrivacyPipeline, "ocr_document", no_ocr)
+
+    r = client.post(f"/api/folders/{fid}/documents/{did}/reapply",
+                    json={"calibration": {"blur_level": 10, "padding_px": 16, "mode": "blur"}})
+    assert r.status_code == 200 and r.json()["status"] == "QUEUED"
+    doc = next(d for d in _wait_idle(client, fid) if d["doc_id"] == did)
+    assert doc["status"] == "BLURRED" and doc["residual_pii_count"] == 0
+    assert doc["calibration"] == {"blur_level": 10, "padding_px": 16, "mode": "blur"}
+    assert client.get(f"/api/folders/{fid}/documents/{did}/image/blurred").content != before
+
+    # solid black mode on the whole folder, saved as the new default
+    r = client.post(f"/api/folders/{fid}/reapply",
+                    json={"calibration": {"blur_level": 5, "padding_px": 6, "mode": "black"}, "save_as_default": True})
+    assert r.status_code == 200 and r.json()["queued"] == 2
+    docs = _wait_idle(client, fid)
+    assert all(d["status"] == "BLURRED" and d["calibration"]["mode"] == "black" for d in docs)
+    from server.image_preprocessing import load_bgr
+    red = load_bgr(str(ui_api.STORE.root / fid / "out" / f"redacted_{pdoc}.png"))
+    assert (red.max(axis=2) == 0).mean() > 0.05                     # solid black boxes are drawn
+    assert client.get(f"/api/folders/{fid}/calibration").json()["calibration"]["mode"] == "black"
+
+    assert client.post(f"/api/folders/{fid}/documents/{did}/reapply",
+                       json={"calibration": {"blur_level": 11}}).status_code == 422
+    blob = (ui_api.STORE.root / fid / "metadata.json").read_text() + r.text \
+        + json.dumps(client.get(f"/api/folders/{fid}/documents").json())
+    assert CNP not in blob and "Ionescu" not in blob and "Florilor" not in blob
+
+
+def test_reapply_rejects_unfinished_documents(client):
+    fid = client.post("/api/folders", json={"name": "Busy"}).json()["folder_id"]
+    with ui_api.STORE.lock:                          # a document that has not been redacted yet
+        meta = ui_api.STORE.load(fid)
+        meta["documents"].append({"doc_id": "d_0123456789", "name": "x.png", "stored": "x.png", "size": 1,
+                                  "created": 0, "status": "ERROR", "pipeline_doc_id": None, "page_count": None,
+                                  "boxes_drawn": None, "residual_pii_count": None, "processed": None, "error": "x"})
+        ui_api.STORE.save(meta)
+    assert client.post(f"/api/folders/{fid}/documents/d_0123456789/reapply", json={}).status_code == 409
+    assert client.post(f"/api/folders/{fid}/reapply", json={}).json()["queued"] == 0
+
+
+# ----------------------------------------------------------------------------- auto-fill from ID card
+def _id_card_png() -> tuple[bytes, object]:
+    import random
+    from faker import Faker
+    from evaluation.generate_synthetic_docs import id_card, make_people, render
+    rng = random.Random(7)
+    fake = Faker("ro_RO")
+    fake.seed_instance(7)
+    p = make_people(rng, fake)[0]
+    lines = id_card(p)
+    img, _ = render(lines, "arial", size=32, width=1500, line_gap=1.75, mrz_from=len(lines) - 2, border=True)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue(), p
+
+
+def _blank_form_png() -> bytes:
+    f = ImageFont.truetype("arial.ttf", 30)
+    img = Image.new("RGB", (1700, 400), "white")
+    d = ImageDraw.Draw(img)
+    for y, label, length in ((60, "Subsemnatul", 700), (150, "CNP", 420), (240, "Telefon", 400)):
+        d.text((60, y), label, fill=(20, 20, 20), font=f)
+        x = d.textbbox((60, y), label, font=f)[2] + 12
+        d.line((x, y + 34, x + length, y + 34), fill=(20, 20, 20), width=2)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_autofill_from_id_card(client):
+    fid = client.post("/api/folders", json={"name": "Autofill"}).json()["folder_id"]
+    id_png, person = _id_card_png()
+    r = client.post(f"/api/folders/{fid}/upload?source=1", files=[("files", ("buletin.png", id_png, "image/png")),
+                                                                 ("files", ("cerere.png", _blank_form_png(), "image/png"))])
+    added = r.json()["added"]
+    assert [d["status"] for d in added] == ["SOURCE", "SOURCE"]          # stored, not queued for redaction
+    time.sleep(0.5)
+    docs = client.get(f"/api/folders/{fid}/documents").json()["documents"]
+    assert all(d["status"] == "SOURCE" for d in docs)
+    id_doc, form_doc = added[0]["doc_id"], added[1]["doc_id"]
+
+    assert client.post(f"/api/folders/{fid}/autofill", json={"id_doc_id": id_doc, "form_doc_id": id_doc}).status_code == 422
+    assert client.post(f"/api/folders/{fid}/autofill", json={"id_doc_id": id_doc, "form_doc_id": form_doc,
+                                                             "extras": {"cnp": "x"}}).status_code == 422
+    r = client.post(f"/api/folders/{fid}/autofill", json={"id_doc_id": id_doc, "form_doc_id": form_doc,
+                                                          "extras": {"phone": "0745 999 888"}})
+    assert r.status_code == 200 and r.json()["status"] == "QUEUED" and r.json()["role"] == "filled"
+    filled = next(d for d in _wait_idle(client, fid) if d["doc_id"] == r.json()["doc_id"])
+    assert filled["status"] == "FILLED", filled.get("error")
+    assert {"full_name", "cnp", "phone"} <= set(filled["filled_fields"])
+
+    # metadata / API: field keys only — no names, CNP, series, nor the typed phone number
+    meta_text = (ui_api.STORE.root / fid / "metadata.json").read_text(encoding="utf-8")
+    blob = meta_text + json.dumps(client.get(f"/api/folders/{fid}/documents").json())
+    for secret in (person.cnp, person.surname, person.surname.upper(), "Lalelelor", person.number, "0745 999 888"):
+        assert secret not in blob
+
+    did = filled["doc_id"]
+    for kind in ("original", "filled"):
+        assert client.get(f"/api/folders/{fid}/documents/{did}/image/{kind}").status_code == 200
+    dl = client.get(f"/api/folders/{fid}/documents/{did}/download")
+    assert dl.status_code == 200 and dl.headers["content-type"] == "image/png"
+    assert "cerere_completat.png" in dl.headers["content-disposition"]
+    assert client.get(f"/api/folders/{fid}/download-all").status_code == 404   # FILLED is never in the blurred zip
+
+    copy = client.post(f"/api/folders/{fid}/documents/{did}/anonymize-copy")
+    assert copy.status_code == 200 and copy.json()["status"] == "QUEUED"
+    anon = next(d for d in _wait_idle(client, fid) if d["doc_id"] == copy.json()["doc_id"])
+    assert anon["status"] == "BLURRED" and anon["boxes_drawn"] >= 2
+    z = zipfile.ZipFile(io.BytesIO(client.get(f"/api/folders/{fid}/download-all").content))
+    assert z.namelist() == ["cerere_completat_anonim_blurred.png"]
+
+    # deleting the filled form keeps the blank form's upload; a source can still be redacted on demand
+    assert client.delete(f"/api/folders/{fid}/documents/{did}").status_code == 200
+    assert (ui_api.STORE.root / fid / "original").joinpath(added[1]["name"]).exists() is False   # names are prefixed
+    assert len(list((ui_api.STORE.root / fid / "original").glob(f"{form_doc}_*"))) == 1
+    red = client.post(f"/api/folders/{fid}/documents/{form_doc}/redact")
+    assert red.status_code == 200 and red.json()["status"] == "QUEUED"
+    assert next(d for d in _wait_idle(client, fid) if d["doc_id"] == form_doc)["status"] == "BLURRED"

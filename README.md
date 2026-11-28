@@ -79,8 +79,14 @@ Example output (no raw text):
 | `ocr_document` | `file_path` | `doc_id, word_count, avg_confidence, image_dimensions, page_count, status` |
 | `detect_pii` | `doc_id, use_local_slm=false` | `detection_id, doc_id, summary{CNP, PERSON_NAME, ADDRESS, ID_SERIES, IBAN, PHONE, EMAIL, BIRTH_DATE, MRZ}, total_boxes, linkable_identifiers` |
 | `link_documents` | `doc_ids?` | `total_documents, clusters[{cluster_id, doc_ids, shared_entity_types, link_strength, links[]}], unlinked_doc_ids, unknown_doc_ids` |
-| `redact_image` | `doc_id, detection_id, padding_px=4` | `result_id, output_path, boxes_drawn, page_count` |
-| `verify_redaction` | `result_id` | `result_id, verified, residual_pii_count, status: PASS/FAIL` |
+| `redact_image` | `doc_id, detection_id, padding_px=4, blur_strength="high"` (`low/medium/high/maximum` or `1..10`) | `result_id, output_path, boxes_drawn, page_count, blur_strength, blur_level, mode` |
+| `verify_redaction` | `result_id` | `result_id, verified, residual_pii_count, status: PASS/FAIL, leak_count, uncovered_count, suggested_blur_strength, suggested_padding_px` |
+| `extract_id_profile` | `doc_id` | `doc_id, is_id_card, is_valid_id, detected_fields[] (field KEYS), field_count, mean_confidence` |
+| `fill_form_from_id` | `id_doc_id, form_doc_id, extra_fields?{phone,email,date,purpose}` | `filled_doc_id, output_path, pdf_path, fields_filled[], unfilled_fields[], page_count` |
+
+**Self-correction:** when `verify_redaction` returns `FAIL`, the agent reads `leak_count` (a known value is still
+readable → blur too weak) and `uncovered_count` (PII-like text outside the boxes → padding too small) and re-runs
+`redact_image` with `blur_strength="maximum"` and +6…12 px padding (at most twice), then verifies again.
 
 **OCR pipeline:** grayscale → deskew (projection-profile search ±10°) → 2× upscale for small scans →
 non-local-means denoising → adaptive Gaussian threshold → Tesseract `ron+eng` (`image_to_data`, word boxes),
@@ -108,9 +114,22 @@ box is padded by `FACE_PADDING_RATIO` (0.3) to cover hair, ears and chin. The fa
 found by template-matching the detected face. Only when no face is found does an ID-card layout rule apply.
 
 **Blur calibration:** every box gets a margin of `max(REDACTION_MIN_PADDING_PX, REDACTION_PADDING_RATIO × box
-height)` (capped at 1.5% of the image's long side) and is grown right through space where OCR read nothing (value
-tails under stamps); block size and kernel scale with box height and image resolution, so a 3000 px phone photo
-and a 600 px scan are equally unreadable.
+height)` (capped at 1.5% of the image's long side, both × a strength-dependent multiplier) and is grown right
+through space where OCR read nothing (value tails under stamps). Noise amplitude, pixelation cell and Gaussian
+kernel adapt to the **text height, image resolution and local contrast**; `blur_strength` (1–10, default `high` = 7)
+raises them further, and even level 1 keeps a safety floor (cell ≥ 0.35 × text height). A residual-legibility
+guard re-blurs any region where stroke-scale detail survives. `REDACTION_MODE=black` draws solid boxes instead.
+
+**Form auto-fill from an ID card:** `server/id_extractor.py` turns the detector's output into a structured profile
+(names — with an MRZ fallback —, CNP and what it encodes, series/number, address split into street / nr / bl / sc /
+et / ap / city / county / sector, birth date/place, issue/expiry dates, issuer, nationality, sex) kept only in the
+vault. `server/form_filler.py` fills **AcroForm PDFs** (field names/tooltips matched fuzzily; values with ș/ț are
+stamped with a TrueType font) and **flat forms** (scans, flat PDFs, images): Romanian labels (`Subsemnatul`, `CNP`,
+`domiciliat în`, `Str.`, `Nr.`, `Bl.`, `posesor al CI seria … nr.`, `eliberat de`, `Data nașterii`, …) are found
+OCR-tolerantly on a copy with rule lines removed, the blank after/below each label is located (underline, dotted
+line, `____`, empty box, or space after `Label:`), and values are drawn with auto-fitted size, document ink colour
+and wrapping onto the next blank line. Font: `FORM_FONT_PATH`, else DejaVu/Liberation, else Arial/Segoe UI (must
+contain ăâîșț). The filled pages become a new document that can go straight through `detect_pii → redact_image`.
 
 **Verification:** the redacted image is re-OCR'd; text hallucinated on or around redacted regions is ignored;
 the detector runs on the remaining visible text and every original PII value is searched for in the new text.
@@ -204,9 +223,19 @@ no build step, no CDN) on top of the same pipeline:
    the same irreversible blur is applied at once (`POST …/documents/{doc}/manual-redact`; boxes survive a rescan,
    *Undo manual* reprocesses the document) — **Download** (PNG, or one PDF for multi-page documents),
    **Rescan**, and **Download all (.zip)** for the whole folder.
+4. **Blur calibration** — a folder panel (strength 1–10, padding 0–24 px, `IRREVERSIBLE BLUR` / `SOLID BLACK`,
+   *Save default*, *Apply & re-verify all*) and the same controls in the preview for one document. Re-apply re-runs
+   redaction + verification **without OCR** from `out/work/<doc>_plan.json` (box coordinates + salted value
+   fingerprints, no text); new uploads inherit the folder default.
+5. **`[ AUTO-FILL FROM ID ]`** — pick (or upload as `[ SOURCE ]`, not redacted) an ID card and a blank form, add
+   optional Telefon / E-mail / Data / Scop, and *Fill form*: the worker produces a `[ FILLED ]` document (preview
+   *Blank* vs *Filled*, download PNG/PDF, **Blur copy** = an anonymized copy that is redacted automatically).
+   Filled forms contain personal data and are never included in *Download all (.zip)*; `metadata.json` stores only
+   which field keys were filled, and the optional typed values are kept in memory only.
 
 Folders persist on disk in `workspace_folders/<folder_id>/` (git-ignored; override with `UI_WORKSPACE`):
-`metadata.json` (names, timestamps, statuses and counts only), `original/` (uploads) and `out/` (pipeline output).
+`metadata.json` (names, timestamps, statuses, counts, numeric blur calibration and filled field *keys* only),
+`original/` (uploads) and `out/` (pipeline output).
 Deleting a folder removes all of it.
 
 Privacy notes: the server binds to `127.0.0.1` only and every API route except login requires a session. OCR text
@@ -237,7 +266,7 @@ larger padding / flag for review). Real-world scans with other layouts will scor
 ## Project structure
 
 ```
-server/       MCP server, vault, OCR, PII detector, linker, redactor, pipeline
+server/       MCP server, vault, OCR, PII detector, linker, redactor, pipeline, id_extractor, form_filler
 agent/        CLI agent loop + offline TTS
 ui/           web terminal: api.py (FastAPI, login + folders) and static/ (index.html, app.js, styles.css)
 evaluation/   synthetic dataset generator, evaluation suite, results*.md

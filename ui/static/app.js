@@ -7,15 +7,23 @@ const ACTIVE = ['QUEUED', 'SCANNING'];
 const FINISHED = ['BLURRED', 'REVIEW'];
 const STATUS_LABEL = {
   QUEUED: '[ QUEUED ]', SCANNING: '[ SCANNING... ]', BLURRED: '[ BLURRED ]', REVIEW: '[ REVIEW ]', ERROR: '[ ERROR ]',
+  FILLED: '[ FILLED ]', SOURCE: '[ SOURCE ]',
 };
+const isFilled = (d) => d.role === 'filled';
+const hasResult = (d) => FINISHED.includes(d.status) || d.status === 'FILLED';     // something to preview / download
+const statusLabel = (d) => (isFilled(d) && ACTIVE.includes(d.status) ? '[ FILLING... ]' : STATUS_LABEL[d.status] || esc(d.status));
 const STATUS_HINT = {
   QUEUED: 'Waiting for the redaction worker',
   SCANNING: 'OCR → PII detection → redaction → verification',
   BLURRED: 'Sensitive data redacted and verified by a second OCR pass',
   REVIEW: 'Redacted, but the verification pass still found PII-like text — check the preview',
+  FILLED: 'Form filled from the ID card — contains personal data (not included in the blurred .zip)',
+  SOURCE: 'Stored as an auto-fill input — not scanned or redacted',
 };
 
-const S = { user: null, view: null, folderId: null, docs: [], seen: new Set(), poll: null, uploading: 0, preview: null };
+const DEFAULT_CALIB = { blur_level: 7, padding_px: 4, mode: 'blur' };
+const S = { user: null, view: null, folderId: null, docs: [], seen: new Set(), poll: null, uploading: 0, preview: null,
+  calib: { ...DEFAULT_CALIB } };
 
 // ------------------------------------------------------------------ helpers
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -199,12 +207,124 @@ async function deleteFolder(id) {
   catch (e) { toast(e.message, true); }
 }
 
+// ------------------------------------------------------------------ blur calibration
+const levelName = (n) => (n <= 3 ? 'LOW' : n <= 5 ? 'MED' : n <= 8 ? 'HIGH' : 'MAX');
+const calibText = (c) => (c.mode === 'black' ? `SOLID BLACK · ${c.padding_px}px` : `BLUR ${levelName(c.blur_level)} ${c.blur_level}/10 · ${c.padding_px}px`);
+function readCalib(root) {
+  return {
+    blur_level: +root.querySelector('[data-k="blur_level"]').value,
+    padding_px: +root.querySelector('[data-k="padding_px"]').value,
+    mode: root.querySelector('[data-k="mode"] button.active').dataset.mode,
+  };
+}
+function paintCalib(root) {
+  const c = readCalib(root);
+  root.querySelector('[data-v="blur_level"]').textContent = `${levelName(c.blur_level)} · ${c.blur_level}`;
+  root.querySelector('[data-v="padding_px"]').textContent = `${c.padding_px} px`;
+  root.classList.toggle('black-mode', c.mode === 'black');
+  const sum = root.querySelector('[data-v="summary"]');
+  if (sum) sum.textContent = `default: ${calibText(S.calib)}`;
+}
+function fillCalib(root, cal) {
+  const c = { ...DEFAULT_CALIB, ...(cal || {}) };
+  root.querySelector('[data-k="blur_level"]').value = c.blur_level;
+  root.querySelector('[data-k="padding_px"]').value = c.padding_px;
+  root.querySelectorAll('[data-k="mode"] button').forEach((b) => b.classList.toggle('active', b.dataset.mode === c.mode));
+  paintCalib(root);
+}
+function bindCalib(root) {
+  root.querySelectorAll('.range').forEach((r) => r.addEventListener('input', () => paintCalib(root)));
+  root.querySelectorAll('[data-k="mode"] button').forEach((b) => b.addEventListener('click', () => {
+    root.querySelectorAll('[data-k="mode"] button').forEach((x) => x.classList.toggle('active', x === b));
+    paintCalib(root);
+  }));
+}
+async function loadFolderCalib(id) {
+  try {
+    const r = await api(`${folderUrl(id)}/calibration`);
+    if (S.folderId !== id) return;
+    S.calib = r.calibration;
+  } catch (_) { S.calib = { ...DEFAULT_CALIB }; }
+  fillCalib($('#calibFolder'), S.calib);
+}
+async function onFolderCalib(e) {
+  const btn = e.target.closest('[data-act]');
+  if (!btn) return;
+  const root = $('#calibFolder');
+  if (btn.dataset.act === 'toggle') {
+    const open = !root.classList.toggle('collapsed');
+    btn.setAttribute('aria-expanded', String(open));
+    return;
+  }
+  const cal = readCalib(root);
+  try {
+    if (btn.dataset.act === 'save') {
+      S.calib = (await api(`${folderUrl(S.folderId)}/calibration`, { method: 'PUT', json: cal })).calibration;
+      paintCalib(root);
+      toast(`default saved — ${calibText(S.calib)}`);
+    }
+    if (btn.dataset.act === 'apply-all') {
+      const r = await api(`${folderUrl(S.folderId)}/reapply`, { method: 'POST', json: { calibration: cal, save_as_default: true } });
+      S.calib = r.calibration; paintCalib(root);
+      toast(r.queued ? `re-applying ${calibText(cal)} to ${r.queued} document(s)` : 'no redacted documents yet — saved as default');
+      stopPolling(); refreshFolder();
+    }
+  } catch (ex) { toast(ex.message, true); }
+}
+function paintDocCalib() {
+  const p = S.preview, root = $('#calibDoc');
+  if (!p) return;
+  const finished = FINISHED.includes(p.doc.status), active = ACTIVE.includes(p.doc.status);
+  root.classList.toggle('hidden', Boolean(p.doc.role) || !(finished || (active && p.doc.processed)));
+  const st = root.querySelector('[data-v="status"]');
+  st.className = `status st-${p.doc.status}`;
+  st.textContent = active ? '[ RE-VERIFYING... ]' : (STATUS_LABEL[p.doc.status] || p.doc.status);
+  st.title = STATUS_HINT[p.doc.status] || '';
+  root.querySelector('[data-act="apply"]').classList.toggle('disabled', !finished);
+}
+async function onDocCalibApply() {
+  const p = S.preview;
+  if (!p) return;
+  const root = $('#calibDoc');
+  const cal = readCalib(root);
+  const saveDefault = root.querySelector('[data-k="save_as_default"]').checked;
+  try {
+    const doc = await api(`${docUrl(p.doc)}/reapply`, { method: 'POST', json: { calibration: cal, save_as_default: saveDefault } });
+    p.doc = doc; p.awaiting = true;
+    if (saveDefault) { S.calib = cal; fillCalib($('#calibFolder'), cal); }
+    paintDocCalib();
+    toast(`re-applying ${calibText(cal)}…`);
+    stopPolling(); refreshFolder();
+  } catch (ex) { toast(ex.message, true); }
+}
+// The preview follows its document while it is re-applied: the new image loads with zoom / pan kept.
+function syncPreviewDoc() {
+  const p = S.preview;
+  if (!p) return;
+  const d = S.docs.find((x) => x.doc_id === p.doc.doc_id);
+  if (!d || (d.processed === p.doc.processed && d.status === p.doc.status)) return;
+  p.doc = d;
+  paintDocCalib();
+  if (!hasResult(d)) return;
+  if (isFilled(d)) { p.pages = d.page_count || 1; renderPreview(); return; }
+  $('#manualBtn').classList.remove('hidden');
+  $('#manualUndo').classList.toggle('hidden', !(d.manual_boxes && d.manual_boxes.length));
+  if ($('#imgBlurred').classList.contains('hidden') || !p.tf) renderPreview();
+  else $('#imgBlurred').src = `${docUrl(d)}/image/blurred?page=${p.page}&v=${d.processed || Date.now()}`;
+  if (p.awaiting) {
+    p.awaiting = false;
+    const review = d.status === 'REVIEW';
+    toast(`re-verified ${STATUS_LABEL[d.status]}${review ? ` — ${d.residual_pii_count} residual hit(s): raise strength / padding` : ''}`, review);
+  }
+}
+
 // ------------------------------------------------------------------ STEP 3 · folder dashboard
 async function openFolder(id) {
   S.folderId = id; S.docs = []; S.seen = new Set();
   $('#docRows').innerHTML = '';
   $('#folderTitle').textContent = ''; delete $('#folderTitle').dataset.orig;
   showView('folder');
+  loadFolderCalib(id);
   await refreshFolder(true);
 }
 async function refreshFolder(first = false) {
@@ -219,9 +339,10 @@ async function refreshFolder(first = false) {
     $('#folderTitle').dataset.orig = f.name;
     document.title = `${f.name} — PrivacyGuard AI`;
   }
-  $('#folderMeta').textContent = `${f.folder_id} · created ${fmtDate(f.created)} · ${f.blurred_count}/${f.document_count} blurred`;
+  $('#folderMeta').textContent = `${f.folder_id} · created ${fmtDate(f.created)} · ${f.blurred_count}/${f.document_count} blurred${f.filled_count ? ` · ${f.filled_count} filled` : ''}`;
   S.docs = data.documents;
   renderDocs();
+  syncPreviewDoc();
   const busy = S.docs.some((d) => ACTIVE.includes(d.status));
   if (busy) S.poll = setTimeout(refreshFolder, 1000);
 }
@@ -235,23 +356,30 @@ function renderDocs() {
   dl.href = done.length ? `${folderUrl(S.folderId)}/download-all` : '#';
 
   $('#docEmpty').classList.toggle('hidden', S.docs.length > 0);
-  const sig = JSON.stringify(S.docs.map((d) => [d.doc_id, d.status]));
+  const sig = JSON.stringify(S.docs.map((d) => [d.doc_id, d.status, d.role]));
   if (renderDocs._sig === sig) return;
   renderDocs._sig = sig;
   $('#docRows').innerHTML = S.docs.map((d) => {
     const isNew = !S.seen.has(d.doc_id);
     S.seen.add(d.doc_id);
-    const finished = FINISHED.includes(d.status);
-    const hint = d.status === 'ERROR' ? d.error : STATUS_HINT[d.status];
+    const finished = hasResult(d);
+    const active = ACTIVE.includes(d.status);
+    const filledHint = d.status === 'FILLED' && d.filled_fields ? ` · filled: ${d.filled_fields.join(', ')}` : '';
+    const hint = d.status === 'ERROR' ? d.error : (STATUS_HINT[d.status] || '') + filledHint;
+    const extra = d.status === 'FILLED'
+      ? '<button class="link-act" data-act="anon" title="Copy the filled form and redact the copy">BLUR COPY</button>'
+      : d.status === 'SOURCE'
+        ? '<button class="link-act" data-act="redact" title="Scan and redact this document">REDACT</button>'
+        : `<button class="link-act ${active ? 'disabled' : ''}" data-act="rescan" title="Run detection and redaction again">RESCAN</button>`;
     const pages = d.page_count > 1 ? ` · ${d.page_count}p` : '';
     return `<tr class="${isNew ? 'new' : ''}" data-id="${d.doc_id}">
       <td class="doc-name" title="${esc(d.name)}">${esc(d.name)}</td>
       <td class="doc-size">${fmtSize(d.size)}${pages}</td>
-      <td><span class="status st-${d.status}" title="${esc(hint || '')}">${STATUS_LABEL[d.status] || esc(d.status)}</span></td>
+      <td><span class="status st-${d.status}" title="${esc(hint || '')}">${statusLabel(d)}</span></td>
       <td><div class="doc-actions">
         <button class="link-act" data-act="preview">PREVIEW</button>
         <a class="link-act ${finished ? '' : 'disabled'}" href="${finished ? `${docUrl(d)}/download` : '#'}" data-act="download">DOWNLOAD</a>
-        <button class="link-act ${ACTIVE.includes(d.status) ? 'disabled' : ''}" data-act="rescan" title="Run detection and redaction again">RESCAN</button>
+        ${extra}
         <button class="link-act danger" data-act="delete" title="Remove document">✕</button>
       </div></td>
     </tr>`;
@@ -282,30 +410,45 @@ async function onDocAction(e) {
     try { await api(`${docUrl(doc)}/rescan`, { method: 'POST' }); toast(`rescanning ${doc.name}`); stopPolling(); refreshFolder(); }
     catch (ex) { toast(ex.message, true); }
   }
+  if (btn.dataset.act === 'anon' || btn.dataset.act === 'redact') {
+    const anon = btn.dataset.act === 'anon';
+    try {
+      const r = await api(`${docUrl(doc)}/${anon ? 'anonymize-copy' : 'redact'}`, { method: 'POST' });
+      toast(anon ? `anonymized copy queued: ${r.name}` : `redacting ${doc.name}`); stopPolling(); refreshFolder();
+    } catch (ex) { toast(ex.message, true); }
+  }
   if (btn.dataset.act === 'delete') {
-    if (!confirm(`Remove "${doc.name}" and its redacted output?`)) return;
+    if (!confirm(`Remove "${doc.name}" and its output?`)) return;
     try { await api(docUrl(doc), { method: 'DELETE' }); stopPolling(); refreshFolder(); } catch (ex) { toast(ex.message, true); }
   }
 }
 
 // ------------------------------------------------------------------ preview
 function openPreview(doc) {
-  const finished = FINISHED.includes(doc.status);
+  const finished = hasResult(doc);
   S.preview = { doc, page: 1, pages: doc.page_count || 1, mode: finished ? 'split' : 'original',
     tf: null, size: null, draw: false };
   $('#previewTitle').textContent = doc.name;
-  $('#manualBtn').classList.toggle('hidden', !finished);
+  $('#manualBtn').classList.toggle('hidden', !FINISHED.includes(doc.status));
   $('#manualBtn').classList.remove('active');
   $('#previewBody').classList.remove('drawing');
   $('#manualUndo').classList.toggle('hidden', !(doc.manual_boxes && doc.manual_boxes.length));
+  fillCalib($('#calibDoc'), doc.calibration || S.calib);
+  $('#calibDoc [data-k="save_as_default"]').checked = false;
+  paintDocCalib();
   $('#preview').classList.remove('hidden');
   renderPreview();
 }
 function renderPreview() {
   const p = S.preview;
   if (!p) return;
-  const finished = FINISHED.includes(p.doc.status);
+  const finished = hasResult(p.doc);
+  const filled = isFilled(p.doc);
+  const names = filled ? { original: 'BLANK', blurred: 'FILLED' } : { original: 'ORIGINAL', blurred: 'BLURRED' };
+  $('.pane-original figcaption').textContent = names.original;
+  $('.pane-blurred figcaption').textContent = names.blurred;
   $$('#previewSeg button').forEach((b) => {
+    if (names[b.dataset.mode]) b.textContent = names[b.dataset.mode];
     b.classList.toggle('active', b.dataset.mode === p.mode);
     b.disabled = !finished && b.dataset.mode !== 'original';
     b.style.opacity = b.disabled ? .3 : '';
@@ -315,7 +458,7 @@ function renderPreview() {
   $('#pageLabel').textContent = `${p.page}/${p.pages}`;
   const v = p.doc.processed || p.doc.created;
   p.tf = null; p.size = null;                       // new page -> fit again once it has loaded
-  for (const [id, kind] of [['#imgOriginal', 'original'], ['#imgBlurred', 'blurred']]) {
+  for (const [id, kind] of [['#imgOriginal', 'original'], ['#imgBlurred', filled ? 'filled' : 'blurred']]) {
     const img = $(id);
     const pane = img.parentElement;
     pane.querySelector('.no-img')?.remove();
@@ -448,7 +591,12 @@ function setupPreviewZoom() {
   $('#manualBtn').onclick = () => setDrawMode(!(S.preview && S.preview.draw));
   $('#manualUndo').onclick = async () => {
     if (!S.preview || !confirm('Remove all manual blur boxes? The document is processed again.')) return;
-    try { await api(`${docUrl(S.preview.doc)}/manual-redact`, { method: 'DELETE' }); closePreview(); toast('manual boxes removed — rescanning'); stopPolling(); refreshFolder(); }
+    try {
+      const doc = await api(`${docUrl(S.preview.doc)}/manual-redact`, { method: 'DELETE' });
+      S.preview.doc = doc; S.preview.awaiting = true; paintDocCalib();
+      $('#manualUndo').classList.add('hidden');
+      toast('manual boxes removed — re-applying'); stopPolling(); refreshFolder();
+    }
     catch (e) { toast(e.message, true); }
   };
   $('#zoomIn').onclick = () => zoomPreview(1.25);
@@ -461,6 +609,52 @@ function closePreview() {
   S.preview = null;
   $('#preview').classList.add('hidden');
   $('#imgOriginal').removeAttribute('src'); $('#imgBlurred').removeAttribute('src');
+}
+
+// ------------------------------------------------------------------ auto-fill from ID card
+const AF = { uploadTarget: null };
+function afOptions(sel, keep) {
+  const docs = S.docs.filter((d) => !isFilled(d) && d.status !== 'ERROR');
+  sel.innerHTML = docs.length
+    ? docs.map((d) => `<option value="${d.doc_id}">${esc(d.name)}${d.status === 'SOURCE' ? '' : `  ${STATUS_LABEL[d.status] || ''}`}</option>`).join('')
+    : '<option value="" disabled selected>// no documents — upload one</option>';
+  if (keep && docs.some((d) => d.doc_id === keep)) sel.value = keep;
+}
+function openAutofill() {
+  const idSel = $('#afId'), formSel = $('#afFormDoc');
+  afOptions(idSel, idSel.value); afOptions(formSel, formSel.value);
+  if (idSel.value && idSel.value === formSel.value && formSel.options.length > 1) formSel.selectedIndex = 1;
+  const date = $('[data-extra="date"]');
+  if (!date.value) { const d = new Date(); date.value = `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()}`; }
+  $('#autofill').classList.remove('hidden');
+  idSel.focus();
+}
+const closeAutofill = () => $('#autofill').classList.add('hidden');
+async function afUpload(file) {
+  const fd = new FormData();
+  fd.append('files', file);
+  try {
+    const r = await api(`${folderUrl(S.folderId)}/upload?source=1`, { method: 'POST', body: fd });
+    await refreshFolder();
+    const sel = AF.uploadTarget === 'id' ? $('#afId') : $('#afFormDoc');
+    afOptions($('#afId'), $('#afId').value); afOptions($('#afFormDoc'), $('#afFormDoc').value);
+    sel.value = r.added[0].doc_id;
+    toast(`stored ${r.added[0].name} as source (not redacted)`);
+  } catch (e) { toast(e.message, true); }
+}
+async function onAutofillSubmit(e) {
+  e.preventDefault();
+  const id = $('#afId').value, form = $('#afFormDoc').value;
+  if (!id || !form) return toast('pick an ID card and a form', true);
+  if (id === form) return toast('the ID card and the form must be different documents', true);
+  const extras = {};
+  $$('[data-extra]').forEach((i) => { if (i.value.trim()) extras[i.dataset.extra] = i.value.trim(); });
+  try {
+    const r = await api(`${folderUrl(S.folderId)}/autofill`, { method: 'POST', json: { id_doc_id: id, form_doc_id: form, extras } });
+    closeAutofill();
+    $$('[data-extra]').forEach((i) => { if (i.dataset.extra !== 'date') i.value = ''; });   // extras are not kept
+    toast(`filling ${r.name}…`); stopPolling(); refreshFolder();
+  } catch (ex) { toast(ex.message, true); }
 }
 
 // ------------------------------------------------------------------ wiring
@@ -494,6 +688,20 @@ function bind() {
   });
   $('#fileInput').onchange = (e) => { uploadFiles(e.target.files); e.target.value = ''; };
   $('#docRows').onclick = onDocAction;
+  $('#autofillBtn').onclick = openAutofill;
+  $('#afForm').addEventListener('submit', onAutofillSubmit);
+  $('#autofill').addEventListener('click', (e) => {
+    const act = e.target.closest('[data-af]')?.dataset.af;
+    if (e.target.id === 'autofill' || act === 'close') closeAutofill();
+    if (act === 'upload-id' || act === 'upload-form') { AF.uploadTarget = act === 'upload-id' ? 'id' : 'form'; $('#afFile').click(); }
+  });
+  $('#afFile').onchange = (e) => { if (e.target.files[0]) afUpload(e.target.files[0]); e.target.value = ''; };
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('#autofill').classList.contains('hidden')) closeAutofill(); });
+  $('#calibDoc .calib-actions').insertAdjacentHTML('afterbegin', '<span class="status" data-v="status"></span>');
+  bindCalib($('#calibFolder'));
+  bindCalib($('#calibDoc'));
+  $('#calibFolder').addEventListener('click', onFolderCalib);
+  $('#calibDoc [data-act="apply"]').onclick = onDocCalibApply;
 
   $$('#previewSeg button').forEach((b) => b.onclick = () => {
     if (!S.preview) return;
@@ -509,6 +717,7 @@ function bind() {
   $('#preview').onclick = (e) => { if (e.target.id === 'preview') closePreview(); };
   document.addEventListener('keydown', (e) => {
     if (!S.preview) return;
+    if (e.target.closest && e.target.closest('.calib') && e.key !== 'Escape') return;   // sliders own their keys
     if (e.key === 'Escape') { if (S.preview.draw) setDrawMode(false); else closePreview(); return; }
     if (e.key === 'b' || e.key === 'B') $('#manualBtn').click();
     if (e.key === 'ArrowRight') $('#pageNext').click();

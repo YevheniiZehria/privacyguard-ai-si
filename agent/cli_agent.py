@@ -51,10 +51,27 @@ text: you only receive opaque ids (doc_*, det_*, res_*), counts, scores and bool
 For EVERY input file:
   1. ocr_document(file_path=<alias such as FILE_1>)
   2. detect_pii(doc_id)
-  3. redact_image(doc_id, detection_id)  — omit padding_px so the safe default (4 px) is used
-  4. verify_redaction(result_id). If status is FAIL, call redact_image again with a larger padding_px
-     (e.g. 10) and verify again (at most once more).
+  3. redact_image(doc_id, detection_id)  — omit padding_px / blur_strength so the safe defaults (4 px, "high")
+     are used
+  4. verify_redaction(result_id). If status is "FAIL", self-correct before moving on:
+     - reason about WHY it failed from the counts only: leak_count > 0 means a known value is still readable
+       (blur too weak -> raise blur_strength); uncovered_count > 0 means PII-like text sits outside the boxes
+       (coverage too small -> raise padding_px more);
+     - call redact_image(doc_id, detection_id, blur_strength="maximum", padding_px=<previous + 6..12>), or
+       simply use suggested_blur_strength / suggested_padding_px from the verification result;
+     - verify_redaction again on the NEW result_id. Retry at most 2 times per document; if it still fails,
+       report it as FAIL (needs manual review).
 After all files are processed call link_documents() once.
+
+FORM FILLING (e.g. "Completează cererea cu datele din buletin" / "fill the form from the ID card"):
+  1. ocr_document on every alias.
+  2. extract_id_profile(doc_id) on each document: the one with is_id_card=true is the ID card, the other one
+     is the blank form. You only see field NAMES (detected_fields), never their values.
+  3. fill_form_from_id(id_doc_id, form_doc_id) — pass extra_fields (phone, email, date, purpose) ONLY with
+     values the user wrote in the task; never invent them.
+  4. Only if the user also asked to anonymize/blur: detect_pii -> redact_image -> verify_redaction on the
+     returned filled_doc_id. Do not redact the inputs and do not call link_documents in a fill-only task.
+  5. Report filled_doc_id, page_count and the filled / unfilled field NAMES.
 If a tool returns an error, read it, fix the arguments or skip that file, and continue.
 Finish with a short report: per file alias -> doc_id, boxes drawn, verification status; then the document
 clusters with their shared entity TYPES and confidence. Never ask the user questions; act autonomously."""
@@ -65,8 +82,22 @@ ALLOWED_KEYS = {
     "PHONE", "EMAIL", "BIRTH_DATE", "MRZ", "total_documents", "clusters", "unlinked_doc_ids", "unknown_doc_ids",
     "cluster_id", "doc_ids", "shared_entity_types", "link_strength", "links", "doc_a", "doc_b",
     "shared_entity_count", "confidence", "result_id", "output_path", "boxes_drawn", "verified",
-    "residual_pii_count", "error", "tool",
+    "residual_pii_count", "error", "tool", "blur_strength", "blur_level", "mode", "leak_count",
+    "uncovered_count", "suggested_blur_strength", "suggested_padding_px", "is_id_card", "is_valid_id",
+    "detected_fields", "field_count", "mean_confidence", "filled_doc_id", "pdf_path", "fields_filled",
+    "unfilled_fields",
 }
+# field-name lists must contain field NAMES only — a value smuggled into such a list is blocked
+FIELD_LIST_KEYS = {"detected_fields", "fields_filled", "unfilled_fields"}
+FIELD_VOCAB = {
+    "last_name", "first_name", "full_name", "cnp", "id_series", "id_number", "id_series_number", "address_full",
+    "county", "city", "street", "street_no", "building", "staircase", "floor", "apartment", "sector",
+    "birth_date", "birth_place", "issue_date", "expiry_date", "issuing_authority", "nationality", "sex",
+    "phone", "email", "date", "purpose",
+}
+PATH_KEYS = ("error.", "output_path.", "pdf_path.")
+FILL_TASK_WORDS = ("anonim", "anonym", "blur", "redact", "estomp")
+MAX_ESCALATIONS = 2
 LEAK_PATTERNS = [re.compile(r"(?<!\d)[1-9]\d{12}(?!\d)"), re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+"),
                  re.compile(r"\bRO\d{2}[A-Z]{4}"), re.compile(r"\b[A-Z]{2}\s?\d{6}\b")]
 
@@ -78,14 +109,29 @@ def privacy_guard(obj: Any, path: str = "") -> list[str]:
         for k, v in obj.items():
             if k not in ALLOWED_KEYS:
                 problems.append(f"unexpected key '{path}{k}'")
+            if k in FIELD_LIST_KEYS and isinstance(v, list) and any(x not in FIELD_VOCAB for x in v):
+                problems.append(f"non-field-name item in '{path}{k}'")
             problems += privacy_guard(v, f"{path}{k}.")
     elif isinstance(obj, list):
         for v in obj:
             problems += privacy_guard(v, path)
-    elif isinstance(obj, str) and not path.endswith("error.") and not path.endswith("output_path."):
+    elif isinstance(obj, str) and not path.endswith(PATH_KEYS):
         if any(p.search(obj) for p in LEAK_PATTERNS):
             problems.append(f"possible PII in '{path.rstrip('.')}'")
     return problems
+
+
+# ----------------------------------------------------------------------------- self-correction
+def escalation_args(prev_args: dict, verify_payload: dict) -> dict:
+    """Next redact_image arguments after a FAIL verification (ids + numbers only, never document content).
+
+    Strength always escalates to "maximum"; padding grows by 12 px when text was left outside the boxes
+    (uncovered_count > 0), otherwise by 6 px. The server's suggested_* values win when they are larger."""
+    pad = int(prev_args.get("padding_px", 4) or 4)
+    step = 12 if int(verify_payload.get("uncovered_count") or 0) > 0 else 6
+    pad = max(pad + step, int(verify_payload.get("suggested_padding_px") or 0))
+    return {"doc_id": prev_args.get("doc_id", ""), "detection_id": prev_args.get("detection_id", ""),
+            "blur_strength": "maximum", "padding_px": min(50, pad)}
 
 
 # ----------------------------------------------------------------------------- MCP -> OpenAI schema
@@ -149,7 +195,8 @@ class Stats:
         self.data = {"documents_processed": 0, "boxes_redacted": 0, "verified_pass": 0, "verified_fail": 0,
                      "clusters": 0, "linked_documents": 0, "tool_errors": 0, "status": "completed"}
         self._latest_boxes: dict[str, int] = {}
-        self._verify: dict[str, bool] = {}
+        self._verify: dict[str, bool] = {}        # doc_id -> latest verification outcome
+        self._res_doc: dict[str, str] = {}        # result_id -> doc_id
 
     def record(self, name: str, args: dict, payload: dict) -> None:
         if "error" in payload:
@@ -160,9 +207,11 @@ class Stats:
             self.data["documents_processed"] = sum(1 for k in self._latest_boxes if k.startswith("doc:"))
         elif name == "redact_image":
             self._latest_boxes["red:" + args.get("doc_id", "")] = payload.get("boxes_drawn", 0)
+            self._res_doc[payload.get("result_id", "")] = args.get("doc_id", "")
             self.data["boxes_redacted"] = sum(v for k, v in self._latest_boxes.items() if k.startswith("red:"))
         elif name == "verify_redaction":
-            self._verify[payload.get("result_id", "")] = bool(payload.get("verified"))
+            rid = payload.get("result_id", "")
+            self._verify[self._res_doc.get(rid, rid)] = bool(payload.get("verified"))
             self.data["verified_pass"] = sum(self._verify.values())
             self.data["verified_fail"] = len(self._verify) - self.data["verified_pass"]
         elif name == "link_documents":
@@ -215,14 +264,30 @@ async def run_agent(task: str, files: list[str], provider: str, model: str | Non
         ocr_cache: dict[str, dict] = {}          # alias -> ocr payload
         result_doc: dict[str, str] = {}          # result_id -> doc_id
         verified_docs: set[str] = set()
+        last_redact: dict[str, dict] = {}        # doc_id -> latest redact_image args
+        failed_verify: dict[str, dict] = {}      # doc_id -> latest FAIL verification payload
+        escalations: dict[str, int] = {}         # doc_id -> redact_image calls after the first one
         linked_after_last_doc = False
+        fill_docs: set[str] = set()              # docs of a completed form fill (exempt from redaction nudges)
+        wants_redaction = any(w in task.lower() for w in FILL_TASK_WORDS)
         nudges = 0
 
         def pending_work() -> list[str]:
             todo = [f"{a}: not processed yet (call ocr_document)" for a in aliases if a not in ocr_cache]
-            todo += [f"{p['doc_id']}: redaction not verified yet" for p in ocr_cache.values()
-                     if p["doc_id"] not in verified_docs]
-            if len(ocr_cache) >= 2 and not linked_after_last_doc:
+            for p in ocr_cache.values():
+                d = p["doc_id"]
+                if d in verified_docs or (d in fill_docs and not wants_redaction):
+                    continue
+                fail = failed_verify.get(d)
+                if fail is None:
+                    todo.append(f"{d}: redaction not verified yet")
+                elif escalations.get(d, 0) < MAX_ESCALATIONS and d in last_redact:
+                    nxt = escalation_args(last_redact[d], fail)
+                    todo.append(f"{d}: verification FAILED (leak_count={fail.get('leak_count', 0)}, "
+                                f"uncovered_count={fail.get('uncovered_count', 0)}) — call redact_image("
+                                f"doc_id='{nxt['doc_id']}', detection_id='{nxt['detection_id']}', "
+                                f"blur_strength='maximum', padding_px={nxt['padding_px']}) then verify_redaction")
+            if len(ocr_cache) >= 2 and not linked_after_last_doc and not fill_docs:
                 todo.append("link_documents has not been called after the last document")
             return todo
 
@@ -280,11 +345,22 @@ async def run_agent(task: str, files: list[str], provider: str, model: str | Non
                                 linked_after_last_doc = False
                             ocr_cache[args["file_path"]] = payload
                         elif name == "redact_image":
-                            result_doc[payload["result_id"]] = args.get("doc_id", "")
-                        elif name == "verify_redaction" and payload.get("verified"):
-                            verified_docs.add(result_doc.get(payload["result_id"], ""))
+                            d = args.get("doc_id", "")
+                            result_doc[payload["result_id"]] = d
+                            if d in last_redact:
+                                escalations[d] = escalations.get(d, 0) + 1
+                            last_redact[d] = dict(args)
+                        elif name == "verify_redaction":
+                            d = result_doc.get(payload.get("result_id", ""), "")
+                            if payload.get("verified"):
+                                verified_docs.add(d)
+                                failed_verify.pop(d, None)
+                            else:
+                                failed_verify[d] = payload
                         elif name == "link_documents":
                             linked_after_last_doc = True
+                        elif name == "fill_form_from_id":
+                            fill_docs |= {args.get("id_doc_id", ""), args.get("form_doc_id", "")}
                 except json.JSONDecodeError:
                     args, payload = {}, {"error": "Arguments were not valid JSON.", "tool": name}
                 except Exception as exc:   # MCP / transport / validation errors -> back to the LLM

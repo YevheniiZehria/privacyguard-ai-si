@@ -7,12 +7,14 @@ Flow: login -> folder hub -> folder dashboard. Every document dropped into a fol
 the unchanged server pipeline (OCR -> PII detection -> irreversible redaction -> verification) by one background
 worker. Folders persist on disk:
 
-    workspace_folders/<folder_id>/metadata.json   folder name, timestamps, per-document status and counts
+    workspace_folders/<folder_id>/metadata.json   folder name, timestamps, blur calibration, per-document status
                                   original/        uploaded files (deleted with the folder)
-                                  out/             pipeline output: work/ (deskewed pages) + redacted_*.png
+                                  out/             pipeline output: work/ (deskewed pages + <pdoc>_plan.json)
+                                                   + redacted_*.png
 
-metadata.json holds ids, statuses and counts only — never OCR text or PII values (those stay in the in-memory
-vault and are cleared after each document). The server binds to 127.0.0.1 and every /api route except login and
+metadata.json holds ids, statuses, counts and the numeric blur calibration only — never OCR text or PII values
+(those stay in the in-memory vault and are cleared after each document). work/<pdoc>_plan.json holds box
+coordinates + salted value fingerprints so the blur can be re-applied and re-verified without OCR. The server binds to 127.0.0.1 and every /api route except login and
 session requires a session token (HttpOnly cookie, or `Authorization: Bearer`).
 """
 from __future__ import annotations
@@ -47,6 +49,8 @@ STATIC = Path(__file__).resolve().parent / "static"
 ALLOWED_EXT = {".png", ".jpg", ".jpeg", ".pdf"}
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 PADDING_PX = 4
+DEFAULT_CALIBRATION = {"blur_level": 7, "padding_px": PADDING_PX, "mode": "blur"}
+STRENGTH_PRESETS = {"low": 3, "medium": 5, "high": 7, "maximum": 10}
 
 UI_USERNAME = os.getenv("UI_USERNAME", "").strip() or "admin"
 UI_PASSPHRASE = os.getenv("UI_PASSPHRASE", "").strip() or "privacyguard"
@@ -57,6 +61,10 @@ FOLDER_RE = re.compile(r"^f_[0-9a-f]{8}$")
 DOC_RE = re.compile(r"^d_[0-9a-f]{10}$")
 ACTIVE = ("QUEUED", "SCANNING")
 FINISHED = ("BLURRED", "REVIEW")      # REVIEW = redacted, but the verification pass still found PII-like text
+FILLED = "FILLED"                     # form auto-filled from an ID card (contains PII — never in the blurred zip)
+SOURCE = "SOURCE"                     # stored as an auto-fill input, not scanned / redacted
+EXTRA_FIELDS = ("phone", "email", "date", "purpose")
+AUTOFILL_EXTRAS: dict[str, dict[str, str]] = {}   # doc_id -> user extras; memory only, never in metadata.json
 
 
 def _safe_name(name: str) -> str:
@@ -131,11 +139,22 @@ class Store:
     def original_path(self, folder_id: str, doc: dict) -> Path:
         return self.root / folder_id / "original" / doc["stored"]
 
-    def page_paths(self, folder_id: str, doc: dict, kind: Literal["original", "blurred"]) -> list[Path]:
+    def page_paths(self, folder_id: str, doc: dict, kind: Literal["original", "blurred", "filled"]) -> list[Path]:
         pdoc, n = doc.get("pipeline_doc_id"), doc.get("page_count") or 0
         if not pdoc:
             return []
         out = self.root / folder_id / "out"
+        if doc.get("role") == "filled":             # original = the blank form, filled = the auto-filled pages
+            if kind == "blurred":
+                return []
+            if kind == "original":
+                pdoc = doc.get("form_pipeline_doc_id") or ""
+                paths = [out / "work" / f"{pdoc}_p{i}.png" for i in range(1, n + 1)]
+            else:
+                paths = [out / f"filled_{pdoc}{'' if i == 1 else f'_p{i}'}.png" for i in range(1, n + 1)]
+            return [p for p in paths if p.is_file()]
+        if kind == "filled":
+            return []
         if kind == "original":                      # deskewed page = the exact frame the redaction was drawn on
             paths = [out / "work" / f"{pdoc}_p{i}.png" for i in range(1, n + 1)]
         else:
@@ -166,7 +185,8 @@ class Store:
         d = self.root / folder_id
         (d / "original").mkdir(parents=True)
         (d / "out").mkdir()
-        meta = {"folder_id": folder_id, "name": name, "created": time.time(), "documents": []}
+        meta = {"folder_id": folder_id, "name": name, "created": time.time(),
+                "calibration": dict(DEFAULT_CALIBRATION), "documents": []}
         with self.lock:
             self.save(meta)
         return meta
@@ -191,16 +211,43 @@ class Store:
             return doc
 
 
+class Calibration(BaseModel):
+    """Numeric blur settings (zero PII) — stored per folder (defaults) and per document (last applied)."""
+    blur_level: int = Field(DEFAULT_CALIBRATION["blur_level"], ge=1, le=10)
+    padding_px: int = Field(DEFAULT_CALIBRATION["padding_px"], ge=0, le=24)
+    mode: Literal["blur", "black"] = "blur"
+
+
+def folder_calibration(meta: dict) -> dict:
+    try:
+        return Calibration(**(meta.get("calibration") or {})).model_dump()
+    except Exception:                               # hand-edited / corrupt metadata -> safe defaults
+        return dict(DEFAULT_CALIBRATION)
+
+
+def doc_calibration(meta: dict, doc: dict) -> dict:
+    try:
+        return Calibration(**doc["calibration"]).model_dump() if doc.get("calibration") else folder_calibration(meta)
+    except Exception:
+        return folder_calibration(meta)
+
+
+def plan_path(folder_id: str, pipeline_doc_id: str) -> Path:
+    return STORE.root / folder_id / "out" / "work" / f"{pipeline_doc_id}_plan.json"
+
+
 def folder_summary(meta: dict) -> dict:
     docs = meta["documents"]
     return {"folder_id": meta["folder_id"], "name": meta["name"], "created": meta["created"],
-            "document_count": len(docs),
+            "calibration": folder_calibration(meta), "document_count": len(docs),
             "blurred_count": sum(1 for d in docs if d["status"] in FINISHED),
+            "filled_count": sum(1 for d in docs if d["status"] == FILLED),
             "processing_count": sum(1 for d in docs if d["status"] in ACTIVE)}
 
 
 def public_doc(doc: dict) -> dict:
-    return {k: v for k, v in doc.items() if k not in ("stored", "pipeline_doc_id")}
+    return {k: v for k, v in doc.items()
+            if k not in ("stored", "pipeline_doc_id", "pending_job", "form_pipeline_doc_id")}
 
 
 STORE = Store(Path(os.getenv("UI_WORKSPACE", "").strip() or ROOT / "workspace_folders"))
@@ -211,7 +258,14 @@ JOBS: queue.Queue[tuple[str, str]] = queue.Queue()
 _worker_started = threading.Event()
 
 
+def _manual_rects(doc: dict) -> list[tuple[int, int, int, int, int]]:
+    return [tuple(int(v) for v in b) for b in (doc.get("manual_boxes") or [])]
+
+
 def process_document(folder_id: str, doc_id: str, pipe) -> None:
+    """Full scan (OCR -> detection -> redaction -> verification) or, for pending_job == "reapply", redaction +
+    verification only, from the saved plan, with the document's calibration. Manual boxes are folded into the
+    detection boxes, so they get the same blur and are covered by the verification pass."""
     store = STORE
     try:
         meta = store.load(folder_id)
@@ -220,33 +274,87 @@ def process_document(folder_id: str, doc_id: str, pipe) -> None:
     doc = next((x for x in meta["documents"] if x["doc_id"] == doc_id), None)
     if not doc or doc["status"] != "QUEUED":
         return
+    if doc.get("pending_job") == "autofill":
+        return run_autofill(folder_id, meta, doc, pipe)
+    cal = doc_calibration(meta, doc)
+    reapply = (doc.get("pending_job") == "reapply" and bool(doc.get("pipeline_doc_id"))
+               and plan_path(folder_id, doc["pipeline_doc_id"]).is_file())
     store.update_doc(folder_id, doc_id, status="SCANNING", error=None)
     pipe.output_dir = store.root / folder_id / "out"
     try:
-        ocr = pipe.ocr_document(str(store.original_path(folder_id, doc)))
-        det = pipe.detect_pii(ocr["doc_id"])
-        red = pipe.redact_image(ocr["doc_id"], det["detection_id"], PADDING_PX)
+        if reapply:
+            pdoc = doc["pipeline_doc_id"]
+            plan = json.loads(plan_path(folder_id, pdoc).read_text(encoding="utf-8"))
+            pages = [str(p) for p in store.page_paths(folder_id, doc, "original")]
+            det_id = pipe.import_plan(pdoc, pages, plan, extra_boxes=_manual_rects(doc))
+            page_count = len(pages)
+        else:
+            ocr = pipe.ocr_document(str(store.original_path(folder_id, doc)))
+            pdoc, page_count = ocr["doc_id"], ocr["page_count"]
+            det_id = pipe.detect_pii(pdoc)["detection_id"]
+            plan_path(folder_id, pdoc).write_text(json.dumps(pipe.export_plan(det_id)), encoding="utf-8")
+            pipe.vault.get_detection(det_id).boxes += _manual_rects(doc)   # user's boxes survive a rescan
+        red = pipe.redact_image(pdoc, det_id, cal["padding_px"], cal["blur_level"], cal["mode"])
         ver = pipe.verify_redaction(red["result_id"])
-        doc = store.update_doc(folder_id, doc_id, status="BLURRED" if ver["verified"] else "REVIEW",
-                               pipeline_doc_id=ocr["doc_id"], page_count=ocr["page_count"],
-                               boxes_drawn=red["boxes_drawn"], residual_pii_count=ver["residual_pii_count"],
-                               processed=time.time())
-        if doc and doc.get("manual_boxes"):         # the user's manual boxes survive a rescan
-            apply_manual_boxes(folder_id, doc, doc["manual_boxes"])
+        store.update_doc(folder_id, doc_id, status="BLURRED" if ver["verified"] else "REVIEW",
+                         pipeline_doc_id=pdoc, page_count=page_count, boxes_drawn=red["boxes_drawn"],
+                         residual_pii_count=ver["residual_pii_count"], calibration=cal, pending_job=None,
+                         processed=time.time())
     except Exception as exc:                       # pipeline errors never contain document text
-        store.update_doc(folder_id, doc_id, status="ERROR", error=f"{type(exc).__name__}: {exc}"[:300])
+        store.update_doc(folder_id, doc_id, status="ERROR", pending_job=None,
+                         error=f"{type(exc).__name__}: {exc}"[:300])
     finally:
         pipe.vault.clear()                         # raw OCR text / PII values do not outlive the job
         if not (store.root / folder_id / "metadata.json").exists():
             shutil.rmtree(store.root / folder_id, ignore_errors=True)   # folder deleted mid-scan
 
 
-def apply_manual_boxes(folder_id: str, doc: dict, boxes: list[list[int]]) -> int:
-    """Blur user-drawn rectangles ([page, x, y, w, h] in page pixels) on the redacted pages, with exactly the
-    same irreversible blur the pipeline uses. Returns how many were applied."""
+def run_autofill(folder_id: str, meta: dict, doc: dict, pipe) -> None:
+    """ID card + blank form (originals on disk) -> filled form pages in out/. Only field KEYS reach metadata."""
+    store = STORE
+    doc_id = doc["doc_id"]
+    extras = AUTOFILL_EXTRAS.pop(doc_id, {})
+    store.update_doc(folder_id, doc_id, status="SCANNING", error=None)
+    pipe.output_dir = store.root / folder_id / "out"
+    work = pipe.output_dir / "work"
+    id_pdoc = None
+    try:
+        by_id = {d["doc_id"]: d for d in meta["documents"]}
+        id_src, form_src = (by_id.get(x) for x in (doc.get("source_ids") or [None, None]))
+        if not id_src or not form_src:
+            raise ValueError("the ID card or the form was deleted")
+        id_pdoc = pipe.ocr_document(str(store.original_path(folder_id, id_src)))["doc_id"]
+        prof = pipe.extract_id_profile(id_pdoc)
+        if not prof["field_count"]:
+            raise ValueError("no ID card fields recognised in the selected source document")
+        form = pipe.ocr_document(str(store.original_path(folder_id, form_src)))
+        res = pipe.fill_form_from_id(id_pdoc, form["doc_id"], extras)
+        for f in work.glob(f"{form['doc_id']}_src_*"):    # keep only the deskewed blank pages (preview)
+            f.unlink(missing_ok=True)
+        store.update_doc(folder_id, doc_id, status=FILLED, pipeline_doc_id=res["filled_doc_id"],
+                         form_pipeline_doc_id=form["doc_id"], page_count=res["page_count"],
+                         filled_fields=res["fields_filled"], unfilled_fields=res["unfilled_fields"],
+                         pending_job=None, processed=time.time())
+    except Exception as exc:                       # error messages never contain document text
+        store.update_doc(folder_id, doc_id, status="ERROR", pending_job=None,
+                         error=f"{type(exc).__name__}: {exc}"[:300])
+    finally:
+        pipe.vault.clear()
+        if id_pdoc:                                # the ID card's deskewed copy is not needed afterwards
+            for f in work.glob(f"{id_pdoc}_*"):
+                f.unlink(missing_ok=True)
+        if not (store.root / folder_id / "metadata.json").exists():
+            shutil.rmtree(store.root / folder_id, ignore_errors=True)
+
+
+def apply_manual_boxes(folder_id: str, doc: dict, boxes: list[list[int]], cal: dict | None = None) -> int:
+    """Redact user-drawn rectangles ([page, x, y, w, h] in page pixels) on the redacted pages, with the same
+    irreversible blur (or solid black) and calibration as the document. Returns how many were applied."""
+    import cv2
     import numpy as np
     from server.image_preprocessing import load_bgr, save_png
     from server.redactor import blur_region
+    cal = cal or doc.get("calibration") or DEFAULT_CALIBRATION
     pages = STORE.page_paths(folder_id, doc, "blurred")
     rng = np.random.default_rng()
     applied = 0
@@ -262,7 +370,10 @@ def apply_manual_boxes(folder_id: str, doc: dict, boxes: list[list[int]]) -> int
             x0, y0 = max(0, int(x)), max(0, int(y))
             x1, y1 = min(w, int(x + bw)), min(h, int(y + bh))
             if x1 - x0 >= 2 and y1 - y0 >= 2:
-                blur_region(img, x0, y0, x1, y1, rng)
+                if cal.get("mode") == "black":
+                    cv2.rectangle(img, (x0, y0), (x1 - 1, y1 - 1), (0, 0, 0), thickness=-1)
+                else:
+                    blur_region(img, x0, y0, x1, y1, rng, int(cal.get("blur_level", 7)))
                 applied += 1
         save_png(str(pages[page_no - 1]), img)
     return applied
@@ -386,7 +497,8 @@ def list_documents(folder_id: str) -> dict:
 
 
 @api.post("/folders/{folder_id}/upload")
-async def upload(folder_id: str, files: list[UploadFile] = File(...)) -> dict:
+async def upload(folder_id: str, files: list[UploadFile] = File(...),
+                 source: bool = Query(False, description="Store as an auto-fill input without redacting")) -> dict:
     d = STORE.folder_dir(folder_id)
     payloads = []
     for up in files:                               # validate everything before writing anything
@@ -408,13 +520,16 @@ async def upload(folder_id: str, files: list[UploadFile] = File(...)) -> dict:
             (d / "original").mkdir(exist_ok=True)
             (d / "original" / stored).write_bytes(data)
             doc = {"doc_id": doc_id, "name": name, "stored": stored, "size": len(data), "created": time.time(),
-                   "status": "QUEUED", "pipeline_doc_id": None, "page_count": None, "boxes_drawn": None,
-                   "residual_pii_count": None, "processed": None, "error": None}
+                   "status": SOURCE if source else "QUEUED", "role": "source" if source else None,
+                   "pipeline_doc_id": None, "page_count": None, "boxes_drawn": None,
+                   "residual_pii_count": None, "processed": None, "error": None,
+                   "calibration": folder_calibration(meta)}      # new files inherit the folder's calibration
             meta["documents"].append(doc)
             added.append(doc)
         STORE.save(meta)
     for doc in added:
-        JOBS.put((folder_id, doc["doc_id"]))
+        if not source:
+            JOBS.put((folder_id, doc["doc_id"]))
     return {"added": [public_doc(x) for x in added]}
 
 
@@ -437,13 +552,17 @@ def delete_document(folder_id: str, doc_id: str) -> dict:
         meta["documents"] = [x for x in meta["documents"] if x["doc_id"] != doc_id]
         STORE.save(meta)
         _remove_outputs(folder_id, doc)
-        STORE.original_path(folder_id, doc).unlink(missing_ok=True)
+        if doc.get("stored"):                      # a filled form has no upload of its own
+            STORE.original_path(folder_id, doc).unlink(missing_ok=True)
     return {"ok": True}
 
 
 def _remove_outputs(folder_id: str, doc: dict) -> None:
-    paths = [*STORE.page_paths(folder_id, doc, "original"), *STORE.page_paths(folder_id, doc, "blurred")]
-    if doc.get("pipeline_doc_id"):
+    paths = [*STORE.page_paths(folder_id, doc, "original"), *STORE.page_paths(folder_id, doc, "blurred"),
+             *STORE.page_paths(folder_id, doc, "filled")]
+    if doc.get("role") == "filled" and doc.get("pipeline_doc_id"):
+        paths.append(STORE.root / folder_id / "out" / f"filled_{doc['pipeline_doc_id']}.pdf")
+    elif doc.get("pipeline_doc_id"):
         paths += list((STORE.root / folder_id / "out" / "work").glob(f"{doc['pipeline_doc_id']}_*"))
     for p in paths:
         p.unlink(missing_ok=True)
@@ -457,8 +576,11 @@ def rescan_document(folder_id: str, doc_id: str) -> dict:
         if doc["status"] in ACTIVE:
             raise HTTPException(409, "Document is already being processed")
         _remove_outputs(folder_id, doc)
+        refill = doc.get("role") == "filled"
         doc = STORE.update_doc(folder_id, doc_id, status="QUEUED", pipeline_doc_id=None, page_count=None,
-                               boxes_drawn=None, residual_pii_count=None, processed=None, error=None)
+                               boxes_drawn=None, residual_pii_count=None, processed=None, error=None,
+                               pending_job="autofill" if refill else "scan",
+                               role="filled" if refill else None)
     JOBS.put((folder_id, doc_id))
     return public_doc(doc)
 
@@ -490,21 +612,172 @@ def manual_redact(folder_id: str, doc_id: str, box: ManualBox) -> dict:
 
 @api.delete("/folders/{folder_id}/documents/{doc_id}/manual-redact")
 def clear_manual_redactions(folder_id: str, doc_id: str) -> dict:
-    """Undo all manual boxes: they are baked into the image, so the document is simply processed again."""
+    """Undo all manual boxes: they are baked into the image, so the redaction is re-applied from the saved plan
+    (or the document is scanned again when there is no plan)."""
     with STORE.lock:
-        _doc(folder_id, doc_id)
-        STORE.update_doc(folder_id, doc_id, manual_boxes=[])
-    return rescan_document(folder_id, doc_id)
+        doc = _doc(folder_id, doc_id)
+        if doc["status"] in ACTIVE:
+            raise HTTPException(409, "Document is already being processed")
+        doc = STORE.update_doc(folder_id, doc_id, manual_boxes=[])
+        if doc["status"] not in FINISHED:
+            return rescan_document(folder_id, doc_id)
+        meta = STORE.load(folder_id)
+        doc = _queue_reapply(folder_id, doc, Calibration(**doc_calibration(meta, doc)))
+    JOBS.put((folder_id, doc_id))
+    return public_doc(doc)
+
+
+class ReapplyRequest(BaseModel):
+    calibration: Calibration = Field(default_factory=Calibration)
+    save_as_default: bool = False
+
+
+@api.get("/folders/{folder_id}/calibration")
+def get_calibration(folder_id: str) -> dict:
+    with STORE.lock:
+        meta = STORE.load(folder_id)
+    return {"calibration": folder_calibration(meta), "presets": STRENGTH_PRESETS,
+            "limits": {"blur_level": [1, 10], "padding_px": [0, 24]}}
+
+
+def _save_folder_calibration(folder_id: str, cal: Calibration) -> dict:
+    with STORE.lock:
+        meta = STORE.load(folder_id)
+        meta["calibration"] = cal.model_dump()      # numeric settings + mode enum only, zero PII
+        STORE.save(meta)
+    return meta["calibration"]
+
+
+@api.put("/folders/{folder_id}/calibration")
+def put_calibration(folder_id: str, cal: Calibration) -> dict:
+    """Folder default blur calibration; documents uploaded afterwards inherit it."""
+    return {"calibration": _save_folder_calibration(folder_id, cal)}
+
+
+def _queue_reapply(folder_id: str, doc: dict, cal: Calibration) -> dict | None:
+    """Caller holds STORE.lock. Without a plan (e.g. scanned before plans existed) it falls back to a rescan."""
+    has_plan = bool(doc.get("pipeline_doc_id")) and plan_path(folder_id, doc["pipeline_doc_id"]).is_file()
+    fields = {"status": "QUEUED", "calibration": cal.model_dump(), "error": None,
+              "pending_job": "reapply" if has_plan else "scan"}
+    if not has_plan:
+        _remove_outputs(folder_id, doc)
+        fields.update(pipeline_doc_id=None, page_count=None, boxes_drawn=None, residual_pii_count=None,
+                      processed=None)
+    return STORE.update_doc(folder_id, doc["doc_id"], **fields)
+
+
+@api.post("/folders/{folder_id}/documents/{doc_id}/reapply")
+def reapply_document(folder_id: str, doc_id: str, req: ReapplyRequest) -> dict:
+    """Re-run redaction + verification (no OCR) with the given calibration."""
+    with STORE.lock:
+        doc = _doc(folder_id, doc_id)
+        if doc["status"] in ACTIVE:
+            raise HTTPException(409, "Document is already being processed")
+        if doc["status"] not in FINISHED:
+            raise HTTPException(409, "Document is not redacted yet")
+        if req.save_as_default:
+            _save_folder_calibration(folder_id, req.calibration)
+        doc = _queue_reapply(folder_id, doc, req.calibration)
+    JOBS.put((folder_id, doc_id))
+    return public_doc(doc)
+
+
+@api.post("/folders/{folder_id}/reapply")
+def reapply_folder(folder_id: str, req: ReapplyRequest) -> dict:
+    """Apply a calibration to every finished document in the folder (optionally saving it as the default)."""
+    queued = []
+    with STORE.lock:
+        meta = STORE.load(folder_id)
+        if req.save_as_default:
+            _save_folder_calibration(folder_id, req.calibration)
+        for doc in meta["documents"]:
+            if doc["status"] in FINISHED and _queue_reapply(folder_id, doc, req.calibration):
+                queued.append(doc["doc_id"])
+    for doc_id in queued:
+        JOBS.put((folder_id, doc_id))
+    return {"queued": len(queued), "calibration": req.calibration.model_dump()}
+
+
+class AutofillRequest(BaseModel):
+    id_doc_id: str = Field(..., pattern=DOC_RE.pattern)
+    form_doc_id: str = Field(..., pattern=DOC_RE.pattern)
+    extras: dict[str, str] = Field(default_factory=dict)
+
+
+@api.post("/folders/{folder_id}/autofill")
+def autofill(folder_id: str, req: AutofillRequest) -> dict:
+    """Queue: fill the blank form with the ID card's data. The result is a new FILLED document."""
+    if req.id_doc_id == req.form_doc_id:
+        raise HTTPException(422, "Pick two different documents (ID card and form)")
+    extras = {}
+    for k, v in req.extras.items():
+        if k not in EXTRA_FIELDS:
+            raise HTTPException(422, f"Unknown extra field '{k}'. Allowed: {', '.join(EXTRA_FIELDS)}")
+        v = re.sub(r"\s+", " ", str(v)).strip()
+        if len(v) > 200:
+            raise HTTPException(422, f"'{k}' is longer than 200 characters")
+        if v:
+            extras[k] = v
+    with STORE.lock:
+        _doc(folder_id, req.id_doc_id)
+        form = _doc(folder_id, req.form_doc_id)
+        meta = STORE.load(folder_id)
+        doc_id = f"d_{uuid.uuid4().hex[:10]}"
+        ext = ".pdf" if Path(form["name"]).suffix.lower() == ".pdf" else ".png"
+        doc = {"doc_id": doc_id, "name": f"{Path(form['name']).stem}_completat{ext}", "stored": "",
+               "size": form["size"], "created": time.time(), "status": "QUEUED", "role": "filled",
+               "source_ids": [req.id_doc_id, req.form_doc_id], "pending_job": "autofill",
+               "pipeline_doc_id": None, "page_count": None, "filled_fields": None, "unfilled_fields": None,
+               "processed": None, "error": None}
+        meta["documents"].append(doc)
+        STORE.save(meta)
+    AUTOFILL_EXTRAS[doc_id] = extras               # user-typed values stay in memory only
+    JOBS.put((folder_id, doc_id))
+    return public_doc(doc)
+
+
+@api.post("/folders/{folder_id}/documents/{doc_id}/anonymize-copy")
+def anonymize_copy(folder_id: str, doc_id: str) -> dict:
+    """Copy a FILLED document into the folder as a normal upload, which is then redacted automatically."""
+    with STORE.lock:
+        doc = _doc(folder_id, doc_id)
+        if doc["status"] != FILLED:
+            raise HTTPException(409, "Only a filled form can be copied for anonymization")
+        name, data = _export(folder_id, doc)
+        meta = STORE.load(folder_id)
+        new_id = f"d_{uuid.uuid4().hex[:10]}"
+        stored = f"{new_id}_{_safe_name(name)}"
+        (STORE.root / folder_id / "original" / stored).write_bytes(data)
+        new = {"doc_id": new_id, "name": f"{Path(name).stem}_anonim{Path(name).suffix}", "stored": stored,
+               "size": len(data), "created": time.time(), "status": "QUEUED", "role": None,
+               "pipeline_doc_id": None, "page_count": None, "boxes_drawn": None, "residual_pii_count": None,
+               "processed": None, "error": None, "calibration": folder_calibration(meta)}
+        meta["documents"].append(new)
+        STORE.save(meta)
+    JOBS.put((folder_id, new_id))
+    return public_doc(new)
+
+
+@api.post("/folders/{folder_id}/documents/{doc_id}/redact")
+def redact_source(folder_id: str, doc_id: str) -> dict:
+    """Turn a stored auto-fill input (SOURCE) into a normal document that gets scanned and redacted."""
+    with STORE.lock:
+        doc = _doc(folder_id, doc_id)
+        if doc["status"] != SOURCE:
+            raise HTTPException(409, "Document is not a stored source")
+        doc = STORE.update_doc(folder_id, doc_id, status="QUEUED", role=None, pending_job="scan")
+    JOBS.put((folder_id, doc_id))
+    return public_doc(doc)
 
 
 @api.get("/folders/{folder_id}/documents/{doc_id}/image/{kind}")
-def document_image(folder_id: str, doc_id: str, kind: Literal["original", "blurred"],
+def document_image(folder_id: str, doc_id: str, kind: Literal["original", "blurred", "filled"],
                    page: int = Query(1, ge=1)) -> FileResponse:
     doc = _doc(folder_id, doc_id)
     pages = STORE.page_paths(folder_id, doc, kind)
     if not pages and kind == "original":           # not scanned yet: show the upload itself if it is an image
         src = STORE.original_path(folder_id, doc)
-        if src.suffix.lower() in {".png", ".jpg", ".jpeg"} and src.is_file():
+        if doc.get("stored") and src.suffix.lower() in {".png", ".jpg", ".jpeg"} and src.is_file():
             pages = [src]
     if page > len(pages):
         raise HTTPException(404, "Image not available")
@@ -513,10 +786,18 @@ def document_image(folder_id: str, doc_id: str, kind: Literal["original", "blurr
 
 def _export(folder_id: str, doc: dict) -> tuple[str, bytes]:
     """(file name, bytes): one page -> PNG, several pages -> a single PDF."""
+    stem = _safe_name(Path(doc["name"]).stem)
+    if doc["status"] == FILLED:                    # auto-filled form: its PDF (multi-page / PDF input) or PNG
+        pdf = STORE.root / folder_id / "out" / f"filled_{doc['pipeline_doc_id']}.pdf"
+        if pdf.is_file():
+            return f"{stem}.pdf", pdf.read_bytes()
+        pages = STORE.page_paths(folder_id, doc, "filled")
+        if not pages:
+            raise HTTPException(404, "Filled document not available")
+        return f"{stem}.png", pages[0].read_bytes()
     pages = STORE.page_paths(folder_id, doc, "blurred")
     if doc["status"] not in FINISHED or not pages:
         raise HTTPException(404, "Document not redacted yet")
-    stem = _safe_name(Path(doc["name"]).stem)
     if len(pages) == 1:
         return f"{stem}_blurred.png", pages[0].read_bytes()
     from PIL import Image

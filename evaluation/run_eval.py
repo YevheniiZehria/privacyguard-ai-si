@@ -66,6 +66,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default=str(GT_PATH.parent), help="Folder with ground_truth.json")
     ap.add_argument("--tag", default="", help="Report suffix, e.g. heldout")
+    ap.add_argument("--blur-strength", default="high", help="low|medium|high|maximum or 1..10 (default high)")
+    ap.add_argument("--no-write", action="store_true", help="Print the report only (keep evaluation/results*.md)")
     a = ap.parse_args()
     gt_path = Path(a.data).resolve() / "ground_truth.json"
     if not gt_path.exists():
@@ -88,7 +90,7 @@ def main() -> None:
         t = time.time()
         ocr = pipe.ocr_document(str(ROOT / doc["file"]))
         det = pipe.detect_pii(ocr["doc_id"])
-        red = pipe.redact_image(ocr["doc_id"], det["detection_id"])
+        red = pipe.redact_image(ocr["doc_id"], det["detection_id"], blur_strength=a.blur_strength)
         ver = pipe.verify_redaction(red["result_id"])
         doc_person[ocr["doc_id"]] = doc["person"]
 
@@ -153,7 +155,7 @@ def main() -> None:
     report = "\n".join([
         "# PrivacyGuard evaluation report" + (f" ({a.tag})" if a.tag else ""), "",
         f"Dataset: {len(gt)} synthetic documents ({len(set(doc_person.values()))} fictional people). "
-        f"Total runtime {time.time() - t0:.0f}s.", "",
+        f"Total runtime {time.time() - t0:.0f}s. Blur strength: {a.blur_strength}.", "",
         "## PII detection", det_tbl, "",
         *([f"Also redacted (not in ground truth, not scored): "
            + ", ".join(f"{k} {v}" for k, v in extra.items()), ""] if extra else []),
@@ -165,7 +167,8 @@ def main() -> None:
     ])
     suffix = f"_{a.tag}" if a.tag else ""
     (out_dir / "eval_report.md").write_text(report, encoding="utf-8")
-    (ROOT / "evaluation" / f"results{suffix}.md").write_text(report, encoding="utf-8")
+    if not a.no_write:
+        (ROOT / "evaluation" / f"results{suffix}.md").write_text(report, encoding="utf-8")
     print(report)
 
 

@@ -65,6 +65,9 @@ class DetectionRecord:
     entities: list[Entity]
     boxes: list[tuple[int, int, int, int, int]]   # (page, x, y, w, h) merged per line
     entity_hashes: dict[str, set[str]] = field(default_factory=dict)  # type -> {hmac}
+    # salted value fingerprints for a detection restored from a plan file (no raw values available):
+    # {"salt": hex, "items": [[normalized_length, sha256hex], ...]}
+    fingerprints: dict | None = None
 
 
 @dataclass
@@ -75,7 +78,31 @@ class RedactionRecord:
     output_paths: list[str]
     boxes_drawn: int
     padding_px: int = 4
+    blur_level: int = 7
+    mode: str = "blur"
+    padding_scale: float = 1.0
     residual_types: list[str] = field(default_factory=list)   # local diagnostics only, never returned
+
+
+@dataclass
+class IDProfileRecord:
+    """Structured ID-card fields (raw values — never serialized to the LLM / UI metadata)."""
+    doc_id: str
+    fields: dict[str, str]
+    confidence: dict[str, float]
+    is_id_card: bool
+    is_valid_id: bool
+
+
+@dataclass
+class FilledRecord:
+    filled_doc_id: str
+    form_doc_id: str
+    id_doc_id: str
+    output_paths: list[str]
+    pdf_path: str | None
+    fields_filled: list[str]
+    unfilled_fields: list[str]
 
 
 class Vault:
@@ -89,6 +116,8 @@ class Vault:
         self._docs: dict[str, DocumentRecord] = {}
         self._detections: dict[str, DetectionRecord] = {}
         self._results: dict[str, RedactionRecord] = {}
+        self._profiles: dict[str, IDProfileRecord] = {}
+        self._filled: dict[str, FilledRecord] = {}
 
     # ---------- ids ----------
     @staticmethod
@@ -125,6 +154,10 @@ class Vault:
                 raise KeyError(f"Unknown detection_id '{detection_id}'. Call detect_pii first.")
             return self._detections[detection_id]
 
+    def detections_for(self, doc_id: str) -> list[DetectionRecord]:
+        with self._lock:
+            return [d for d in self._detections.values() if d.doc_id == doc_id]
+
     # ---------- redactions ----------
     def put_result(self, rec: RedactionRecord) -> None:
         with self._lock:
@@ -136,8 +169,31 @@ class Vault:
                 raise KeyError(f"Unknown result_id '{result_id}'. Call redact_image first.")
             return self._results[result_id]
 
+    # ---------- ID profiles / filled forms ----------
+    def put_profile(self, rec: IDProfileRecord) -> None:
+        with self._lock:
+            self._profiles[rec.doc_id] = rec
+
+    def get_profile(self, doc_id: str) -> IDProfileRecord:
+        with self._lock:
+            if doc_id not in self._profiles:
+                raise KeyError(f"No ID profile for '{doc_id}'. Call extract_id_profile first.")
+            return self._profiles[doc_id]
+
+    def put_filled(self, rec: FilledRecord) -> None:
+        with self._lock:
+            self._filled[rec.filled_doc_id] = rec
+
+    def get_filled(self, filled_doc_id: str) -> FilledRecord:
+        with self._lock:
+            if filled_doc_id not in self._filled:
+                raise KeyError(f"Unknown filled_doc_id '{filled_doc_id}'.")
+            return self._filled[filled_doc_id]
+
     def clear(self) -> None:
         with self._lock:
+            self._profiles.clear()
+            self._filled.clear()
             self._docs.clear()
             self._detections.clear()
             self._results.clear()

@@ -71,7 +71,10 @@
         <h1 class="mono h1"><span id="folderTitle" data-scramble-text></span><span class="cursor">_</span></h1>
         <div id="folderMeta" class="mono dim small"></div>
       </div>
-      <a id="downloadAll" class="btn btn-primary disabled" href="#" data-scramble>[ DOWNLOAD ALL (.ZIP) ]</a>
+      <div class="dash-actions">
+        <button id="autofillBtn" type="button" class="btn btn-ghost" data-scramble>[ AUTO-FILL FROM ID ]</button>
+        <a id="downloadAll" class="btn btn-primary disabled" href="#" data-scramble>[ DOWNLOAD ALL (.ZIP) ]</a>
+      </div>
     </div>
 
     <label id="dropZone" class="drop">
@@ -83,6 +86,31 @@
       </div>
       <div class="laser"></div>
     </label>
+
+    <section id="calibFolder" class="calib collapsed" aria-label="Blur calibration">
+      <button type="button" class="calib-toggle mono" data-act="toggle" aria-expanded="false">[ BLUR CALIBRATION <span class="calib-caret">▾</span> ]
+        <span class="calib-summary dim" data-v="summary"></span></button>
+      <div class="calib-body">
+        <div class="calib-ctl">
+          <label class="calib-field"><span class="calib-label mono">STRENGTH</span>
+            <input type="range" class="range" data-k="blur_level" min="1" max="10" step="1" value="7" aria-label="Blur strength 1 to 10">
+            <span class="calib-val mono" data-v="blur_level">HIGH · 7</span></label>
+          <label class="calib-field"><span class="calib-label mono">PADDING</span>
+            <input type="range" class="range" data-k="padding_px" min="0" max="24" step="1" value="4" aria-label="Box padding in pixels">
+            <span class="calib-val mono" data-v="padding_px">4 px</span></label>
+          <div class="calib-field"><span class="calib-label mono">MODE</span>
+            <div class="seg mono" data-k="mode" role="radiogroup">
+              <button type="button" data-mode="blur" class="active" role="radio">IRREVERSIBLE BLUR</button>
+              <button type="button" data-mode="black" role="radio">SOLID BLACK</button>
+            </div></div>
+        </div>
+        <p class="desc calib-hint">Cell size, kernel and noise already adapt to font size, resolution and contrast; strength raises them further. Every level stays unreadable. New uploads inherit the saved default.</p>
+        <div class="calib-actions">
+          <button type="button" class="btn btn-ghost btn-sm" data-act="save" data-scramble>[ SAVE DEFAULT ]</button>
+          <button type="button" class="btn btn-primary btn-sm" data-act="apply-all" data-scramble>[ APPLY &amp; RE-VERIFY ALL ]</button>
+        </div>
+      </div>
+    </section>
 
     <div class="table-wrap">
       <table class="doc-table">
@@ -123,11 +151,65 @@
       </div>
       <button id="previewClose" class="btn btn-ghost btn-sm" title="Close (Esc)">✕</button>
     </div>
+    <section id="calibDoc" class="calib calib-strip hidden" aria-label="Document blur calibration">
+      <div class="calib-ctl">
+          <label class="calib-field"><span class="calib-label mono">STRENGTH</span>
+            <input type="range" class="range" data-k="blur_level" min="1" max="10" step="1" value="7" aria-label="Blur strength 1 to 10">
+            <span class="calib-val mono" data-v="blur_level">HIGH · 7</span></label>
+          <label class="calib-field"><span class="calib-label mono">PADDING</span>
+            <input type="range" class="range" data-k="padding_px" min="0" max="24" step="1" value="4" aria-label="Box padding in pixels">
+            <span class="calib-val mono" data-v="padding_px">4 px</span></label>
+          <div class="calib-field"><span class="calib-label mono">MODE</span>
+            <div class="seg mono" data-k="mode" role="radiogroup">
+              <button type="button" data-mode="blur" class="active" role="radio">IRREVERSIBLE BLUR</button>
+              <button type="button" data-mode="black" role="radio">SOLID BLACK</button>
+            </div></div>
+        </div>
+      <div class="calib-actions">
+        <label class="check mono dim"><input type="checkbox" data-k="save_as_default"> save as folder default</label>
+        <button type="button" class="btn btn-primary btn-sm" data-act="apply" data-scramble>[ APPLY &amp; RE-VERIFY ]</button>
+      </div>
+    </section>
     <div id="previewBody" class="modal-body mode-blurred">
       <figure class="pane pane-original"><figcaption class="mono">ORIGINAL</figcaption><img id="imgOriginal" alt="Original document" draggable="false"></figure>
       <figure class="pane pane-blurred"><figcaption class="mono">BLURRED</figcaption><img id="imgBlurred" alt="Redacted document" draggable="false"></figure>
     </div>
   </div>
+</div>
+
+<!-- ================= AUTO-FILL MODAL ================= -->
+<div id="autofill" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="afTitle">
+  <form id="afForm" class="modal-box af-box" autocomplete="off">
+    <div class="modal-head">
+      <span id="afTitle" class="mono">&gt; AUTO-FILL FROM ID</span>
+      <div class="grow"></div>
+      <button type="button" class="btn btn-ghost btn-sm" data-af="close" title="Close (Esc)">✕</button>
+    </div>
+    <div class="af-body">
+      <p class="desc">The ID card's data is written onto the blank form locally. Values never leave this machine and are never stored in the folder's metadata — only which fields were filled.</p>
+      <label class="field">
+        <span class="field-label mono">1 · source id card (buletin)</span>
+        <span class="af-pick"><select id="afId" class="input mono" required></select>
+          <button type="button" class="btn btn-ghost btn-sm" data-af="upload-id">[ UPLOAD ]</button></span>
+      </label>
+      <label class="field">
+        <span class="field-label mono">2 · target blank form (formular gol)</span>
+        <span class="af-pick"><select id="afFormDoc" class="input mono" required></select>
+          <button type="button" class="btn btn-ghost btn-sm" data-af="upload-form">[ UPLOAD ]</button></span>
+      </label>
+      <div class="field-label mono af-sub">3 · optional — not on the id card</div>
+      <div class="af-grid">
+        <label class="field"><span class="field-label mono">telefon</span><input class="input mono" data-extra="phone" maxlength="40"></label>
+        <label class="field"><span class="field-label mono">e-mail</span><input class="input mono" data-extra="email" maxlength="120"></label>
+        <label class="field"><span class="field-label mono">data curentă</span><input class="input mono" data-extra="date" maxlength="20"></label>
+        <label class="field"><span class="field-label mono">scopul cererii</span><input class="input mono" data-extra="purpose" maxlength="200"></label>
+      </div>
+      <input id="afFile" type="file" accept=".pdf,.png,.jpg,.jpeg" hidden>
+    </div>
+    <div class="af-foot">
+      <button type="submit" class="btn btn-primary" data-scramble>[ FILL FORM ]</button>
+    </div>
+  </form>
 </div>
 
 <div id="toast" class="toast mono hidden"></div>

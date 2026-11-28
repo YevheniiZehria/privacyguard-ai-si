@@ -26,7 +26,13 @@ mcp = MCPServer(
     "privacyguard",
     instructions=(
         "Local privacy vault for document anonymization. Workflow per document: "
-        "ocr_document -> detect_pii -> redact_image -> verify_redaction; call link_documents after "
+        "ocr_document -> detect_pii -> redact_image -> verify_redaction. If verify_redaction returns FAIL, "
+        "call redact_image again with an escalated blur_strength (e.g. high -> maximum) and a larger padding_px "
+        "(leak_count > 0: blur too weak; uncovered_count > 0: boxes/padding too small; suggested_* fields give the "
+        "next step), then verify again. To fill a blank form from an ID card: ocr_document both files, call "
+        "extract_id_profile on each (the one with is_id_card=true is the ID), then fill_form_from_id(id_doc_id, "
+        "form_doc_id); the returned filled_doc_id can go through detect_pii -> redact_image like any document. "
+        "Call link_documents after "
         "detect_pii on several documents to find which ones belong to the same person. "
         "You only ever receive opaque ids and counts; raw PII never leaves this server."
     ),
@@ -92,6 +98,9 @@ class RedactionResult(BaseModel):
     output_path: str
     boxes_drawn: int
     page_count: int
+    blur_strength: str = Field(description="Preset name (low/medium/high/maximum) or the numeric level")
+    blur_level: int = Field(description="Blur level 1..10 actually applied")
+    mode: Literal["blur", "black"]
 
 
 class VerificationResult(BaseModel):
@@ -99,12 +108,34 @@ class VerificationResult(BaseModel):
     verified: bool
     residual_pii_count: int
     status: Literal["PASS", "FAIL"]
+    leak_count: int = Field(description="Known PII values still readable (blur too weak -> raise blur_strength)")
+    uncovered_count: int = Field(description="PII-like text outside the boxes (coverage short -> raise padding_px)")
+    suggested_blur_strength: Literal["low", "medium", "high", "maximum"] | None = None
+    suggested_padding_px: int | None = None
 
 
-def _safe(op: str, fn, *args):
+class IDProfileResult(BaseModel):
+    doc_id: str
+    is_id_card: bool = Field(description="The document looks like a Romanian ID card (CI / buletin)")
+    is_valid_id: bool = Field(description="A checksum-valid CNP and a series/number were found")
+    detected_fields: list[str] = Field(description="Profile field KEYS found (values stay in the vault)")
+    field_count: int
+    mean_confidence: float
+
+
+class FillResult(BaseModel):
+    filled_doc_id: str = Field(description="New document id of the filled form (usable with detect_pii)")
+    output_path: str
+    pdf_path: str | None
+    fields_filled: list[str] = Field(description="Form field KEYS that were written")
+    unfilled_fields: list[str] = Field(description="Form field KEYS found on the form but without a value")
+    page_count: int
+
+
+def _safe(op: str, fn, *args, **kwargs):
     """Run a pipeline step; convert failures into ToolErrors with non-sensitive messages."""
     try:
-        return fn(*args)
+        return fn(*args, **kwargs)
     except (KeyError, ValueError, FileNotFoundError) as exc:
         msg = exc.args[0] if exc.args else str(exc)
         log.warning("%s failed: %s", op, msg)
@@ -145,17 +176,45 @@ def redact_image(
     doc_id: Annotated[str, Field(description="doc_id returned by ocr_document")],
     detection_id: Annotated[str, Field(description="detection_id returned by detect_pii")],
     padding_px: Annotated[int, Field(ge=0, le=50, description="Extra pixels around each box")] = 4,
+    blur_strength: Annotated[Literal["low", "medium", "high", "maximum"] | Annotated[int, Field(ge=1, le=10)],
+                             Field(description="Blur intensity: low|medium|high|maximum or 1..10. "
+                                               "Escalate to 'maximum' after a FAIL verification")] = "high",
 ) -> RedactionResult:
-    """Irreversibly blur every detected PII region (or black-box it with REDACTION_MODE=black) and save output/redacted_<doc_id>.png."""
-    return RedactionResult(**_safe("redact_image", pipeline.redact_image, doc_id, detection_id, padding_px))
+    """Irreversibly blur every detected PII region (or black-box it with REDACTION_MODE=black) and save output/redacted_<doc_id>.png.
+    Blur cell size, kernel and noise adapt to text height, image resolution and contrast; blur_strength raises them further."""
+    return RedactionResult(**_safe("redact_image", pipeline.redact_image, doc_id, detection_id, padding_px,
+                                   blur_strength))
 
 
 @mcp.tool()
 def verify_redaction(
     result_id: Annotated[str, Field(description="result_id returned by redact_image")],
 ) -> VerificationResult:
-    """Re-run OCR + PII detection on the redacted image and confirm nothing readable remains."""
+    """Re-run OCR + PII detection on the redacted image and confirm nothing readable remains.
+    On FAIL, re-run redact_image with suggested_blur_strength / suggested_padding_px and verify again."""
     return VerificationResult(**_safe("verify_redaction", pipeline.verify_redaction, result_id))
+
+
+@mcp.tool()
+def extract_id_profile(
+    doc_id: Annotated[str, Field(description="doc_id of an ID card returned by ocr_document")],
+) -> IDProfileResult:
+    """Structure the ID card's fields (names, CNP, series/number, address parts, dates, issuer) inside the vault.
+    Returns only which field keys were found — never the values."""
+    return IDProfileResult(**_safe("extract_id_profile", pipeline.extract_id_profile, doc_id))
+
+
+@mcp.tool()
+def fill_form_from_id(
+    id_doc_id: Annotated[str, Field(description="doc_id of the ID card (after extract_id_profile)")],
+    form_doc_id: Annotated[str, Field(description="doc_id of the blank form returned by ocr_document")],
+    extra_fields: Annotated[dict[str, str] | None, Field(
+        description="Optional values the user gave that are not on the ID: phone, email, date, purpose")] = None,
+) -> FillResult:
+    """Fill the blank form (PDF form fields or flat scan/image) with the ID card's data; writes
+    output/filled_<id>.png (+ .pdf) and registers it as a new document. Returns field keys only."""
+    return FillResult(**_safe("fill_form_from_id", pipeline.fill_form_from_id, id_doc_id, form_doc_id,
+                              extra_fields))
 
 
 def main() -> None:
