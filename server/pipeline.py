@@ -64,16 +64,31 @@ class PrivacyPipeline:
     # 2 ----------------------------------------------------------------------
     def detect_pii(self, doc_id: str, use_local_slm: bool = False) -> dict:
         doc = self.vault.get_document(doc_id)
-        entities = self.detector.detect(doc.words, use_local_slm=use_local_slm,
-                                        slm_base_url=config.LOCAL_SLM_BASE_URL, slm_model=config.LOCAL_SLM_MODEL)
+        entities, regions = self.detector.detect_with_regions(
+            doc.words, use_local_slm=use_local_slm, slm_base_url=config.LOCAL_SLM_BASE_URL,
+            slm_model=config.LOCAL_SLM_MODEL)
         boxes = entity_boxes(entities, doc.words)
+        boxes += regions                                          # label value blocks incl. unread lines
         # cover value tails OCR could not read (only grows into space with no OCR'd words)
         boxes = extend_into_unread(boxes, doc.words, {p.number: p.width for p in doc.pages})
         boxes += unread_value_boxes(doc.words, doc.pages)         # "Semnatura client: <unreadable>"
         portraits = portrait_boxes(doc.words, doc.pages)          # faces / ID photo / signature (no text)
         boxes += portraits
+        if portraits and (self.detector.universal.id_context(doc.words)
+                          or any(e.type in ("MRZ", "CNP", "ID_SERIES", "ID_DATE") for e in entities)):
+            covered = {i for e in entities for i in e.word_indices}
+            extra = [e for e in self.detector.universal.portrait_column_names(doc.words, portraits)
+                     if not set(e.word_indices) <= covered]      # names next to the photo (labels unreadable)
+            entities += extra
+            boxes += entity_boxes(extra, doc.words)
         hashes = entity_hashes(entities, self.vault.hmac_hex)
-        det = DetectionRecord(self.vault.new_id("det"), doc_id, entities, boxes, hashes)
+        # safety net: an identity document (ID / passport cues or a face) with almost no text PII detected is far
+        # more likely a missed layout than a clean document -> verification will ask for a human review
+        text_hits = sum(1 for e in entities if e.type not in ("MRZ",))
+        id_like = bool(portraits) or self.detector.universal.id_context(doc.words) or any(
+            e.type in ("MRZ", "CNP", "ID_SERIES") for e in entities)
+        low_coverage = id_like and text_hits < 2
+        det = DetectionRecord(self.vault.new_id("det"), doc_id, entities, boxes, hashes, low_coverage=low_coverage)
         self.vault.put_detection(det)
         self.linker.update_document(doc_id, hashes)
         summary = summarize(entities)
@@ -141,10 +156,11 @@ class PrivacyPipeline:
                         rec.residual_types.append(f"LEAK:{e.type}:{e.value}")
             elif det.fingerprints:
                 leaks += self._fingerprint_leaks(det.fingerprints, text, new_entities)
-        residual = uncovered + leaks
+        residual = uncovered + leaks + (1 if det.low_coverage else 0)
         verified = residual == 0
         out = {"result_id": result_id, "verified": verified, "residual_pii_count": residual,
                "status": "PASS" if verified else "FAIL", "leak_count": leaks, "uncovered_count": uncovered,
+               "low_coverage": det.low_coverage,
                "suggested_blur_strength": None, "suggested_padding_px": None}
         if not verified:   # escalation ladder for the agent / UI (value-free guidance)
             out["suggested_blur_strength"] = "maximum"
@@ -176,7 +192,8 @@ class PrivacyPipeline:
             fps = {"salt": salt.hex(), "items": [[len(n), _fp(salt, n)] for n in norms]}
         else:
             fps = det.fingerprints or {"salt": secrets.token_hex(16), "items": []}
-        return {"version": 1, "boxes": [[int(v) for v in b] for b in det.boxes], "fingerprints": fps}
+        return {"version": 1, "boxes": [[int(v) for v in b] for b in det.boxes], "fingerprints": fps,
+                "low_coverage": det.low_coverage}
 
     def import_plan(self, doc_id: str, page_paths: list, plan: dict, extra_boxes=()) -> str:
         """Restore a document (deskewed page images) + detection from export_plan() under the ORIGINAL doc_id,
@@ -190,7 +207,8 @@ class PrivacyPipeline:
         self.vault.put_document(DocumentRecord(doc_id, str(page_paths[0]), pages, [], 0.0))
         boxes = [tuple(int(v) for v in b) for b in [*plan.get("boxes", []), *extra_boxes]]
         det = DetectionRecord(self.vault.new_id("det"), doc_id, [], boxes, {},
-                              fingerprints=plan.get("fingerprints") or None)
+                              fingerprints=plan.get("fingerprints") or None,
+                              low_coverage=bool(plan.get("low_coverage")))
         self.vault.put_detection(det)
         return det.detection_id
 

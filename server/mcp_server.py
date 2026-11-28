@@ -60,6 +60,7 @@ class PIISummary(BaseModel):
     EMAIL: int = 0
     BIRTH_DATE: int = 0
     MRZ: int = 0
+    PARTY: int = 0
 
 
 class DetectionResult(BaseModel):
@@ -110,6 +111,7 @@ class VerificationResult(BaseModel):
     status: Literal["PASS", "FAIL"]
     leak_count: int = Field(description="Known PII values still readable (blur too weak -> raise blur_strength)")
     uncovered_count: int = Field(description="PII-like text outside the boxes (coverage short -> raise padding_px)")
+    low_coverage: bool = Field(False, description="Identity document with almost no text PII detected: needs review")
     suggested_blur_strength: Literal["low", "medium", "high", "maximum"] | None = None
     suggested_padding_px: int | None = None
 

@@ -182,9 +182,16 @@ def extract_profile(doc: DocumentRecord, entities: list[Entity]) -> IDProfileRec
     # address (all ADDRESS entities in reading order) + components
     addr = [e for e in entities if e.type == "ADDRESS"]
     if addr:
-        addr.sort(key=lambda e: min(e.word_indices) if e.word_indices else 0)
-        full = re.sub(r"\s+", " ", ", ".join(dict.fromkeys(e.value.strip(" ,") for e in addr)))
-        full = re.sub(r"\s+,", ",", full)
+        # several detectors may report the same address (whole block / line by line): join the UNION of words
+        pos = {i: (li, k) for li, l in enumerate(lines) for k, i in enumerate(l.word_idx)}
+        idx = sorted({i for e in addr for i in e.word_indices if i in pos}, key=lambda i: pos[i])
+        by_line: dict[int, list[str]] = {}
+        for i in idx:
+            by_line.setdefault(pos[i][0], []).append(doc.words[i].text)
+        full = ", ".join(" ".join(ws).strip(" ,") for ws in by_line.values()) if by_line else \
+            ", ".join(dict.fromkeys(e.value.strip(" ,") for e in addr))
+        full = re.sub(r"\s+", " ", full)
+        full = re.sub(r"\s+,", ",", full).replace(",,", ",")
         # a value wrapped over two card lines joins without punctuation: "ap. 24 Mun. Iasi" -> "ap. 24, Mun. Iasi"
         full = re.sub(r"(?<=[^,\s])\s+(?=(?:Mun|Municipiul|Jud|Jude[tț]ul|Ora[sș]|Com|Comuna|Sat|Sector)\b)",
                       ", ", full)

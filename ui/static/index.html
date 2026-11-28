@@ -36,6 +36,7 @@
 <header id="topbar" class="topbar hidden">
   <a href="#/folders" class="logo mono">PRIVACYGUARD <span class="dim">//</span> TERMINAL<span class="cursor">_</span></a>
   <div class="grow"></div>
+  <button id="rulesBtn" class="btn btn-ghost btn-sm" title="Labels learned from your manual blur boxes" data-scramble>[ LEARNED RULES (<span id="rulesCount">0</span>) ]</button>
   <span id="whoami" class="mono dim small"></span>
   <button id="logoutBtn" class="btn btn-ghost btn-sm" data-scramble>[ LOGOUT ]</button>
 </header>
@@ -103,6 +104,10 @@
               <button type="button" data-mode="blur" class="active" role="radio">IRREVERSIBLE BLUR</button>
               <button type="button" data-mode="black" role="radio">SOLID BLACK</button>
             </div></div>
+        </div>
+        <div class="calib-deep">
+          <label class="check mono"><input type="checkbox" data-k="deep_scan"> DEEP / UNIVERSAL SCAN</label>
+          <span id="slmHint" class="dim small mono"></span>
         </div>
         <p class="desc calib-hint">Cell size, kernel and noise already adapt to font size, resolution and contrast; strength raises them further. Every level stays unreadable. New uploads inherit the saved default.</p>
         <div class="calib-actions">
@@ -211,6 +216,18 @@
     </div>
   </form>
 </div>
+
+<!-- ================= LEARNED RULES DRAWER ================= -->
+<aside id="rulesDrawer" class="drawer hidden" aria-label="Learned rules">
+  <div class="drawer-head">
+    <span class="mono">&gt; LEARNED RULES</span>
+    <div class="grow"></div>
+    <button id="rulesReset" class="btn btn-ghost btn-sm" title="Forget every learned rule">RESET ALL</button>
+    <button id="rulesClose" class="btn btn-ghost btn-sm" title="Close">✕</button>
+  </div>
+  <p class="desc drawer-note">Learned from your manual blur boxes: only the label next to the box, where the value sits and its shape — never the value itself. Applied to every folder and to the agent.</p>
+  <ul id="rulesList" class="rules-list mono"></ul>
+</aside>
 
 <div id="toast" class="toast mono hidden"></div>
 <script src="/static/app.js"></script>

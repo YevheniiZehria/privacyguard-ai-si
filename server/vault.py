@@ -68,6 +68,7 @@ class DetectionRecord:
     # salted value fingerprints for a detection restored from a plan file (no raw values available):
     # {"salt": hex, "items": [[normalized_length, sha256hex], ...]}
     fingerprints: dict | None = None
+    low_coverage: bool = False      # ID-like document with almost no text PII found -> needs human review
 
 
 @dataclass

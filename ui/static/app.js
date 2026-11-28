@@ -160,6 +160,7 @@ async function logout() {
 // ------------------------------------------------------------------ STEP 2 · folder hub
 async function openHub() {
   showView('hub');
+  loadRules();
   $('#whoami').textContent = `${S.user}@localhost`;
   typewrite($('#hubType'));
   await refreshHub(true);
@@ -211,10 +212,12 @@ async function deleteFolder(id) {
 const levelName = (n) => (n <= 3 ? 'LOW' : n <= 5 ? 'MED' : n <= 8 ? 'HIGH' : 'MAX');
 const calibText = (c) => (c.mode === 'black' ? `SOLID BLACK · ${c.padding_px}px` : `BLUR ${levelName(c.blur_level)} ${c.blur_level}/10 · ${c.padding_px}px`);
 function readCalib(root) {
+  const deep = root.querySelector('[data-k="deep_scan"]');
   return {
     blur_level: +root.querySelector('[data-k="blur_level"]').value,
     padding_px: +root.querySelector('[data-k="padding_px"]').value,
     mode: root.querySelector('[data-k="mode"] button.active').dataset.mode,
+    deep_scan: deep ? deep.checked : Boolean((S.preview && S.preview.doc.calibration || S.calib).deep_scan),
   };
 }
 function paintCalib(root) {
@@ -223,21 +226,35 @@ function paintCalib(root) {
   root.querySelector('[data-v="padding_px"]').textContent = `${c.padding_px} px`;
   root.classList.toggle('black-mode', c.mode === 'black');
   const sum = root.querySelector('[data-v="summary"]');
-  if (sum) sum.textContent = `default: ${calibText(S.calib)}`;
+  if (sum) sum.textContent = `default: ${calibText(S.calib)}${S.calib.deep_scan ? ' · DEEP' : ''}`;
+  const all = root.querySelector('[data-act="apply-all"]');
+  if (all) all.textContent = c.deep_scan !== Boolean(S.calib.deep_scan) ? '[ APPLY & RESCAN ALL ]' : '[ APPLY & RE-VERIFY ALL ]';
 }
 function fillCalib(root, cal) {
   const c = { ...DEFAULT_CALIB, ...(cal || {}) };
   root.querySelector('[data-k="blur_level"]').value = c.blur_level;
   root.querySelector('[data-k="padding_px"]').value = c.padding_px;
   root.querySelectorAll('[data-k="mode"] button').forEach((b) => b.classList.toggle('active', b.dataset.mode === c.mode));
+  const deep = root.querySelector('[data-k="deep_scan"]');
+  if (deep) deep.checked = Boolean(c.deep_scan);
   paintCalib(root);
 }
 function bindCalib(root) {
   root.querySelectorAll('.range').forEach((r) => r.addEventListener('input', () => paintCalib(root)));
+  root.querySelectorAll('[data-k="deep_scan"]').forEach((c) => c.addEventListener('change', () => paintCalib(root)));
   root.querySelectorAll('[data-k="mode"] button').forEach((b) => b.addEventListener('click', () => {
     root.querySelectorAll('[data-k="mode"] button').forEach((x) => x.classList.toggle('active', x === b));
     paintCalib(root);
   }));
+}
+async function loadSlmStatus() {
+  const box = $('#calibFolder .calib-deep .check'), hint = $('#slmHint');
+  try {
+    const s = await api('/api/slm-status');
+    box.classList.toggle('disabled', !s.available);
+    hint.textContent = s.available ? `local model: ${s.model} — slower, finds PII on any layout` : '// start Ollama on localhost to enable';
+    if (!s.available) box.querySelector('input').checked = false;
+  } catch (_) { hint.textContent = ''; }
 }
 async function loadFolderCalib(id) {
   try {
@@ -246,6 +263,7 @@ async function loadFolderCalib(id) {
     S.calib = r.calibration;
   } catch (_) { S.calib = { ...DEFAULT_CALIB }; }
   fillCalib($('#calibFolder'), S.calib);
+  loadSlmStatus();
 }
 async function onFolderCalib(e) {
   const btn = e.target.closest('[data-act]');
@@ -325,6 +343,7 @@ async function openFolder(id) {
   $('#folderTitle').textContent = ''; delete $('#folderTitle').dataset.orig;
   showView('folder');
   loadFolderCalib(id);
+  loadRules();
   await refreshFolder(true);
 }
 async function refreshFolder(first = false) {
@@ -537,7 +556,8 @@ async function applyManualBox(a, b) {
     $('#imgBlurred').src = `${docUrl(doc)}/image/blurred?page=${p.page}&v=${Date.now()}`;   // reload, keep zoom
     p.tf = keep;
     $('#manualUndo').classList.remove('hidden');
-    toast(`blurred ${w}×${h}px`);
+    if (doc.learned_rule) { toast(`blurred ${w}×${h}px · learned: "${doc.learned_rule.label}" → ${doc.learned_rule.relation}`); loadRules(); }
+    else toast(`blurred ${w}×${h}px`);
     const i = S.docs.findIndex((d) => d.doc_id === doc.doc_id);
     if (i >= 0) S.docs[i] = doc;
   } catch (e) { toast(e.message, true); }
@@ -657,6 +677,19 @@ async function onAutofillSubmit(e) {
   } catch (ex) { toast(ex.message, true); }
 }
 
+// ------------------------------------------------------------------ learned rules
+async function loadRules() {
+  let rules = [];
+  try { rules = (await api('/api/learned-rules')).rules; } catch (_) { return; }
+  $('#rulesCount').textContent = rules.length;
+  $('#rulesList').innerHTML = rules.length ? rules.map((r) => `<li data-id="${esc(r.id)}">
+      <span class="r-label">"${esc(r.label)}"</span>
+      <span class="r-meta">value ${r.relation === 'right' ? 'right of' : 'below'} the label · ${esc(r.shape)} · used ${r.hits}× · ${fmtDate(r.created)}</span>
+      <button class="btn btn-ghost btn-sm r-del" data-del="${esc(r.id)}" title="Forget this rule">✕</button></li>`).join('')
+    : '<li class="rules-empty">// nothing learned yet — draw a [ + MANUAL BLUR BOX ] next to a label the detector missed</li>';
+}
+function toggleRules(open) { $('#rulesDrawer').classList.toggle('hidden', !open); if (open) loadRules(); }
+
 // ------------------------------------------------------------------ wiring
 function bind() {
   $('#loginForm').addEventListener('submit', onLogin);
@@ -689,6 +722,19 @@ function bind() {
   $('#fileInput').onchange = (e) => { uploadFiles(e.target.files); e.target.value = ''; };
   $('#docRows').onclick = onDocAction;
   $('#autofillBtn').onclick = openAutofill;
+  $('#rulesBtn').onclick = () => toggleRules($('#rulesDrawer').classList.contains('hidden'));
+  $('#rulesClose').onclick = () => toggleRules(false);
+  $('#rulesList').onclick = async (e) => {
+    const id = e.target.closest('[data-del]')?.dataset.del;
+    if (!id) return;
+    try { await api(`/api/learned-rules/${encodeURIComponent(id)}`, { method: 'DELETE' }); toast('rule removed'); loadRules(); }
+    catch (ex) { toast(ex.message, true); }
+  };
+  $('#rulesReset').onclick = async () => {
+    if (!confirm('Forget every learned rule?')) return;
+    try { const r = await api('/api/learned-rules', { method: 'DELETE' }); toast(`${r.removed} rule(s) removed`); loadRules(); }
+    catch (ex) { toast(ex.message, true); }
+  };
   $('#afForm').addEventListener('submit', onAutofillSubmit);
   $('#autofill').addEventListener('click', (e) => {
     const act = e.target.closest('[data-af]')?.dataset.af;

@@ -191,18 +191,18 @@ def test_index_is_public(anon):
 def test_calibration_persists_and_is_inherited(client):
     fid = client.post("/api/folders", json={"name": "Calib"}).json()["folder_id"]
     got = client.get(f"/api/folders/{fid}/calibration").json()
-    assert got["calibration"] == {"blur_level": 7, "padding_px": 4, "mode": "blur"} and got["presets"]["maximum"] == 10
+    assert got["calibration"] == {"blur_level": 7, "padding_px": 4, "mode": "blur", "deep_scan": False} and got["presets"]["maximum"] == 10
 
     r = client.put(f"/api/folders/{fid}/calibration", json={"blur_level": 9, "padding_px": 12, "mode": "blur"})
     assert r.status_code == 200
     meta = json.loads((ui_api.STORE.root / fid / "metadata.json").read_text())
-    assert meta["calibration"] == {"blur_level": 9, "padding_px": 12, "mode": "blur"}
+    assert meta["calibration"] == {"blur_level": 9, "padding_px": 12, "mode": "blur", "deep_scan": False}
     for bad in ({"blur_level": 11}, {"blur_level": 0}, {"padding_px": 30}, {"mode": "pixel"}):
         assert client.put(f"/api/folders/{fid}/calibration", json=bad).status_code == 422
 
     client.post(f"/api/folders/{fid}/upload", files=[("files", ("a.png", _png(), "image/png"))])
     doc = _wait_idle(client, fid)[0]
-    assert doc["calibration"] == {"blur_level": 9, "padding_px": 12, "mode": "blur"}   # inherited by new uploads
+    assert doc["calibration"] == {"blur_level": 9, "padding_px": 12, "mode": "blur", "deep_scan": False}   # inherited by new uploads
     assert doc["status"] == "BLURRED"
 
 
@@ -228,7 +228,7 @@ def test_reapply_without_ocr_updates_preview_and_status(client, monkeypatch):
     assert r.status_code == 200 and r.json()["status"] == "QUEUED"
     doc = next(d for d in _wait_idle(client, fid) if d["doc_id"] == did)
     assert doc["status"] == "BLURRED" and doc["residual_pii_count"] == 0
-    assert doc["calibration"] == {"blur_level": 10, "padding_px": 16, "mode": "blur"}
+    assert doc["calibration"] == {"blur_level": 10, "padding_px": 16, "mode": "blur", "deep_scan": False}
     assert client.get(f"/api/folders/{fid}/documents/{did}/image/blurred").content != before
 
     # solid black mode on the whole folder, saved as the new default

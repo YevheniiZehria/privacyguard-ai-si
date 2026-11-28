@@ -33,3 +33,6 @@ Thumbs.db
 .vscode/
 .claude/
 .idea/
+
+# rules learned from manual blur boxes (labels only, but per-installation)
+learned_rules.json

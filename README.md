@@ -108,6 +108,38 @@ and names / document number **read from the MRZ** and redacted wherever they app
 right of a label or under it (by line order and by position, tolerant to skew). Detected name tokens are
 propagated to other occurrences (signatures). Optional: spaCy `ro_core_news_sm`, local Ollama SLM.
 
+**Any layout / language (`server/universal_detector.py`):** words are regrouped into visual rows and split into
+column cells, so two-column blocks (`Seller:` | `Client:`), tables and bilingual ID cards (`Прізвище/ Surname` with
+the value on the next lines) are read correctly. A multilingual label lexicon (EN/FR/DE/IT/ES/RO: surname, given
+names, holder, date of birth, document / record / personal no., tax id, IBAN, address, place of birth, seller / buyer /
+customer / patient …, tolerant to OCR slips such as `Surnamo`, `Mo.`) finds values right of a label or in the rows
+below it in the same column, until the next label, a section header or a large gap. Value blocks are also redacted
+as **regions** from the label down to the last value line, so lines OCR could not read (Cyrillic, faint print) are
+covered. Plus IBANs of any country (mod-97), unlabelled postal blocks (`City, ST 12345`, `12345 City` + street line),
+every date on an identity document, names in the text column next to the photo when the labels are unreadable
+(low-res ID photos), and an unlabelled handwritten signature on identity documents.
+
+**Cyrillic / foreign second OCR pass:** when a page shows Cyrillic read as Latin look-alikes (`MAP'AHA`,
+`IBAHIBHA`) or a non-ROU MRZ, it is OCR'd again with `OCR_LANGS_FOREIGN` (default `ron+eng+rus`, plus `ukr` when
+installed) and merged line by line, keeping the better reading. Romanian documents keep the fast `ron+eng` pass.
+
+**Photographed documents:** a sheet / card photographed at an angle on a contrasting background is found
+(largest convex 4-corner contour covering > 25% of the image, visibly not a rectangle) and flattened with a
+perspective warp before deskew and OCR, so OCR boxes and blur rectangles align with the text
+(`DEWARP_ENABLED=true`). Scans and full-bleed pages are left to the projection-profile deskew.
+
+**Learning from manual blur boxes (`server/rule_learner.py`):** when you draw `[ + MANUAL BLUR BOX ]`, the
+nearest label left of / above the box is OCR'd (with the box masked out) and stored as a rule — normalized label
+words, whether the value is right of or below it, the value's *shape* (`ALPHA_WORDS`, `DIGITS_9_13`, `DATE_LIKE`,
+…) and rounded relative coordinates. **The value itself is never stored.** Rules are validated on write and on
+load (no digit run > 4, no `@`, no IBAN / CNP / phone shapes, no known names) and kept in one git-ignored
+`learned_rules.json` (`LEARNED_RULES_PATH`) used by every folder, the MCP server and the agent. View / delete them
+in the web UI (`[ LEARNED RULES (N) ]`) or via `GET/DELETE /api/learned-rules`.
+
+**Safety net:** an identity document (passport / ID cues or a detected face) where almost no text PII was found is
+reported by `verify_redaction` as `FAIL` with `low_coverage: true` (`[ REVIEW ]` in the web UI) instead of a
+misleading PASS.
+
 **Faces / portraits:** OpenCV **YuNet** (`models/face_detection_yunet_2023mar.onnx`, MIT licence, from
 `opencv/opencv_zoo`) finds faces anywhere on any document, retrying rotated copies (90°/180°, ±20°, ±35°); the
 box is padded by `FACE_PADDING_RATIO` (0.3) to cover hair, ears and chin. The faint *ghost* photo on ID cards is
@@ -226,7 +258,9 @@ no build step, no CDN) on top of the same pipeline:
 4. **Blur calibration** — a folder panel (strength 1–10, padding 0–24 px, `IRREVERSIBLE BLUR` / `SOLID BLACK`,
    *Save default*, *Apply & re-verify all*) and the same controls in the preview for one document. Re-apply re-runs
    redaction + verification **without OCR** from `out/work/<doc>_plan.json` (box coordinates + salted value
-   fingerprints, no text); new uploads inherit the folder default.
+   fingerprints, no text); new uploads inherit the folder default. `[ DEEP / UNIVERSAL SCAN ]` adds a local SLM
+   pass (Ollama on localhost only — enabled when one answers) with a layout-agnostic JSON prompt; toggling it
+   rescans the documents.
 5. **`[ AUTO-FILL FROM ID ]`** — pick (or upload as `[ SOURCE ]`, not redacted) an ID card and a blank form, add
    optional Telefon / E-mail / Data / Scop, and *Fill form*: the worker produces a `[ FILLED ]` document (preview
    *Blank* vs *Filled*, download PNG/PDF, **Blur copy** = an anonymized copy that is redacted automatically).

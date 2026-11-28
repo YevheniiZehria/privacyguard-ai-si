@@ -279,11 +279,21 @@ class PIIDetector:
         self._addr_label_re = re.compile(r"(?:^|\b)(?:" + "|".join(ADDRESS_LABELS) + r")\b\s*[:.;,\-]?\s*", re.I)
         self._addr_start_re = re.compile(r"\b" + ADDRESS_START, re.I)
 
+        # layout-agnostic multilingual labels + rules learned from manual blur boxes (shared learned_rules.json)
+        from server.universal_detector import UniversalDetector
+        self.universal = UniversalDetector()           # learned rules: the shared store, resolved per detection
+
     # ---------------------------------------------------------------- public
     def detect(self, words: list[Word], use_local_slm: bool = False,
                slm_base_url: str | None = None, slm_model: str | None = None) -> list[Entity]:
+        return self.detect_with_regions(words, use_local_slm, slm_base_url, slm_model)[0]
+
+    def detect_with_regions(self, words: list[Word], use_local_slm: bool = False, slm_base_url: str | None = None,
+                            slm_model: str | None = None) -> tuple[list[Entity], list[tuple[int, int, int, int, int]]]:
+        """Entities + extra regions (value blocks of labels, incl. lines OCR could not read) to redact."""
         lines = build_lines(words)
-        entities: list[Entity] = []
+        uni_entities, regions = self.universal.detect(words)
+        entities: list[Entity] = list(uni_entities)
         entities += self._regex_entities(lines, words)
         entities += self._name_entities(lines, words)
         entities += self._address_entities(lines, words)
@@ -298,7 +308,7 @@ class PIIDetector:
         if use_local_slm and slm_base_url and slm_model:
             entities += self._slm_entities(lines, words, slm_base_url, slm_model)
         entities = self._propagate_names(entities, lines, words)
-        return self._dedupe(entities)
+        return self._dedupe(entities), regions
 
     def _is_field_label(self, norm: str) -> bool:
         """True if a line is another form / ID-card field label rather than a value.
@@ -504,7 +514,10 @@ class PIIDetector:
                 idx = list(lines[li + 1].word_idx)
             if idx:
                 value = " ".join(words[i].text for i in idx)
-                if len(value) >= 6:
+                # what follows the label must be real content — not blur texture read as '[' or 'Co'
+                after = rest[: end - start] if end > start else value
+                if len(value) >= 6 and (re.search(r"[A-Za-zĂÂÎȘŞȚŢăâîșşțţ]{3,}|\d", after)
+                                        or len(idx) > len(_words_in_span(line, start, end))):
                     out.append(Entity("ADDRESS", value, idx, 0.85, "context"))
         return out
 
@@ -768,26 +781,56 @@ class PIIDetector:
             from openai import OpenAI
             client = OpenAI(base_url=base_url, api_key="local", timeout=60)
             text = "\n".join(l.text for l in lines)
-            prompt = ("Extract every person full name and postal address from this Romanian document. "
-                      'Answer ONLY JSON: {"names": [...], "addresses": [...]} using exact substrings.\n\n' + text)
+            prompt = ("You find personal data in ANY document (ID card, passport, invoice, contract, medical note, "
+                      "diploma, form; any language or layout; OCR text may contain errors). Return ONLY JSON: "
+                      '{"entities": [{"type": "PERSON_NAME|ADDRESS|ID_NUMBER|DATE_OF_BIRTH|PHONE|EMAIL|IBAN", '
+                      '"text": "<exact substring of the document>"}]}. Do not include company names, prices or '
+                      "document titles.\n\n" + text)
             resp = client.chat.completions.create(model=model, temperature=0,
                                                   messages=[{"role": "user", "content": prompt}])
             content = resp.choices[0].message.content or "{}"
             data = json.loads(content[content.find("{"): content.rfind("}") + 1])
         except Exception:
             return []
+        type_map = {"PERSON_NAME": "PERSON_NAME", "ADDRESS": "ADDRESS", "ID_NUMBER": "ID_SERIES",
+                    "DATE_OF_BIRTH": "BIRTH_DATE", "PHONE": "PHONE", "EMAIL": "EMAIL", "IBAN": "IBAN"}
+        items = [(type_map.get(str(e.get("type", "")).upper()), e.get("text")) for e in data.get("entities", [])
+                 if isinstance(e, dict)]
+        items += [("PERSON_NAME", v) for v in data.get("names", []) or []]        # older answer format
+        items += [("ADDRESS", v) for v in data.get("addresses", []) or []]
         out = []
-        for etype, key in (("PERSON_NAME", "names"), ("ADDRESS", "addresses")):
-            for value in data.get(key, []) or []:
-                if not isinstance(value, str) or len(value) < 3:
-                    continue
-                for line in lines:
-                    pos = line.text.find(value)
-                    if pos >= 0:
-                        idx = _words_in_span(line, pos, pos + len(value))
-                        if idx:
-                            out.append(Entity(etype, value, idx, 0.75, "slm"))
+        for etype, value in items:
+            if not etype or not isinstance(value, str) or len(value.strip()) < 3:
+                continue
+            value = value.strip()
+            for line in lines:
+                pos = line.text.find(value)
+                if pos < 0:                       # tolerate OCR / model whitespace differences
+                    m = re.search(r"\s*".join(map(re.escape, value.split())), line.text)
+                    pos, value_len = (m.start(), m.end() - m.start()) if m else (-1, 0)
+                else:
+                    value_len = len(value)
+                if pos >= 0:
+                    idx = _words_in_span(line, pos, pos + value_len)
+                    if idx:
+                        out.append(Entity(etype, value, idx, 0.75, "slm"))
         return out
+
+    @classmethod
+    def slm_available(cls, base_url: str, timeout: float = 1.0) -> bool:
+        """A local OpenAI-compatible server (Ollama / LM Studio) answers on localhost. Never probes remote hosts."""
+        if not base_url or not cls._is_local(base_url):
+            return False
+        import urllib.request
+        root = base_url.rstrip("/")
+        for url in (root + "/models", root.rsplit("/v1", 1)[0] + "/api/tags"):
+            try:
+                with urllib.request.urlopen(url, timeout=timeout) as resp:      # noqa: S310 (localhost only)
+                    if resp.status == 200:
+                        return True
+            except Exception:
+                continue
+        return False
 
     # ---------------------------------------------------------------- propagation & dedupe
     def _propagate_names(self, entities: list[Entity], lines: list[Line], words: list[Word]) -> list[Entity]:
@@ -973,14 +1016,31 @@ def portrait_boxes(words: list[Word], pages: list) -> list[tuple[int, int, int, 
     3. On identity documents: the handwritten signature area under the signature label."""
     lines = build_lines(words)
     is_id = bool(lines) and bool(ID_CARD_CONTEXT.search(" ".join(l.norm for l in lines)))
+    from server.universal_detector import UniversalDetector
+    foreign_id = not is_id and UniversalDetector(learned=None).id_context(words)
     boxes: list[tuple[int, int, int, int, int]] = []
     for page in pages:
         faces = _face_boxes(page.base_image_path, page.number)
+        if len(faces) > 1:                          # ghost photos sit on the background, never over printed text
+            main = max(faces, key=lambda f: f[3] * f[4])
+            texty = [w for w in words if w.page == page.number and re.search(r"[^\W\d_]{3,}", w.text)]
+
+            def over_text(f) -> bool:
+                _, x, y, fw, fh = f
+                hits = [w for w in texty if w.x < x + fw and w.x + w.w > x and w.y < y + fh and w.y + w.h > y]
+                return len(hits) >= 2
+            faces = [f for f in faces if f is main or not over_text(f)]
         boxes += faces
         plines = [l for l in lines if words[l.word_idx[0]].page == page.number]
-        if not is_id or not plines:
+        if not plines or not (is_id or foreign_id):
             continue
-        boxes += _signature_boxes(plines, words, page)
+        sig = _signature_boxes(plines, words, page)
+        if not sig:                                 # unlabelled cursive signature (foreign IDs, passports)
+            ink = ink_signature_box(page, words, faces)
+            sig = [ink] if ink else []
+        boxes += sig
+        if not is_id:
+            continue
         if faces:
             continue
 
@@ -1018,6 +1078,50 @@ def portrait_boxes(words: list[Word], pages: list) -> list[tuple[int, int, int, 
                 boxes.append((page.number, margin, band_top + gap, max(1, left - gap - margin - pad),
                               band_bottom - band_top - gap - margin))
     return boxes
+
+
+def ink_signature_box(page, words: list[Word], avoid: list[tuple[int, int, int, int, int]]
+                      ) -> tuple[int, int, int, int, int] | None:
+    """An unlabelled handwritten signature on an identity document: the darkest compact ink cluster in the lower
+    part of the page that no OCR word explains (cursive is not read as text). At most one per page."""
+    import cv2
+    import numpy as np
+    img = cv2.imread(page.base_image_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return None
+    H, W = img.shape
+    pw = [w for w in words if w.page == page.number]
+    text_h = int(np.median([w.h for w in pw])) if pw else max(12, H // 40)
+    ink = (img < min(110, int(np.percentile(img, 8)))).astype(np.uint8) * 255   # dark ink only, not guilloche
+    for w in pw:                                          # printed text is explained by OCR
+        ink[max(0, w.y - 3):w.y + w.h + 3, max(0, w.x - 3):w.x + w.w + 3] = 0
+    for _p, x, y, bw, bh in avoid:                        # faces / already redacted areas
+        ink[max(0, y):y + bh, max(0, x):x + bw] = 0
+    ink[: int(H * 0.6)] = 0
+    m = int(min(H, W) * 0.03)                             # card borders / page edges
+    ink[:, :m] = ink[:, W - m:] = ink[H - m:, :] = 0
+    blob = cv2.dilate(ink, cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, text_h), max(3, text_h // 2))))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(blob, connectivity=8)
+    text_bottom = max((w.y + w.h for w in pw), default=0)
+    best, best_key = None, None
+    for k in range(1, n):
+        x, y, bw, bh, _a = stats[k]
+        if not (1.5 * text_h <= bw <= 0.35 * W and 0.7 * text_h <= bh <= 5 * text_h):
+            continue
+        mass = int((ink[y:y + bh, x:x + bw] > 0).sum())
+        density = mass / float(bw * bh)
+        if not 0.02 <= density <= 0.35:
+            continue
+        # a signature sits under the printed fields; unread print between fields must not win
+        key = (y + bh / 2 >= text_bottom - text_h * 0.5, mass)
+        if best_key is None or key > best_key:
+            best, best_key = (int(x), int(y), int(bw), int(bh)), key
+    if best is None:
+        return None
+    x, y, bw, bh = best                                   # faint stroke ends fall outside the dark core
+    px, py = max(int(0.25 * bw), text_h // 2), max(int(0.35 * bh), text_h // 2)
+    x0, y0 = max(0, x - px), max(0, y - py)
+    return page.number, x0, y0, min(W, x + bw + px) - x0, min(H, y + bh + py) - y0
 
 
 def _signature_boxes(plines: list[Line], words: list[Word], page) -> list[tuple[int, int, int, int, int]]:

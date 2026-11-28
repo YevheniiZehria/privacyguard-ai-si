@@ -49,7 +49,7 @@ STATIC = Path(__file__).resolve().parent / "static"
 ALLOWED_EXT = {".png", ".jpg", ".jpeg", ".pdf"}
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 PADDING_PX = 4
-DEFAULT_CALIBRATION = {"blur_level": 7, "padding_px": PADDING_PX, "mode": "blur"}
+DEFAULT_CALIBRATION = {"blur_level": 7, "padding_px": PADDING_PX, "mode": "blur", "deep_scan": False}
 STRENGTH_PRESETS = {"low": 3, "medium": 5, "high": 7, "maximum": 10}
 
 UI_USERNAME = os.getenv("UI_USERNAME", "").strip() or "admin"
@@ -216,6 +216,7 @@ class Calibration(BaseModel):
     blur_level: int = Field(DEFAULT_CALIBRATION["blur_level"], ge=1, le=10)
     padding_px: int = Field(DEFAULT_CALIBRATION["padding_px"], ge=0, le=24)
     mode: Literal["blur", "black"] = "blur"
+    deep_scan: bool = False             # + local SLM (Ollama on localhost) universal pass when available
 
 
 def folder_calibration(meta: dict) -> dict:
@@ -291,7 +292,7 @@ def process_document(folder_id: str, doc_id: str, pipe) -> None:
         else:
             ocr = pipe.ocr_document(str(store.original_path(folder_id, doc)))
             pdoc, page_count = ocr["doc_id"], ocr["page_count"]
-            det_id = pipe.detect_pii(pdoc)["detection_id"]
+            det_id = pipe.detect_pii(pdoc, use_local_slm=bool(cal.get("deep_scan")) and slm_available())["detection_id"]
             plan_path(folder_id, pdoc).write_text(json.dumps(pipe.export_plan(det_id)), encoding="utf-8")
             pipe.vault.get_detection(det_id).boxes += _manual_rects(doc)   # user's boxes survive a rescan
         red = pipe.redact_image(pdoc, det_id, cal["padding_px"], cal["blur_level"], cal["mode"])
@@ -607,7 +608,41 @@ def manual_redact(folder_id: str, doc_id: str, box: ManualBox) -> dict:
             raise HTTPException(400, "Rectangle is outside the page")
         doc = STORE.update_doc(folder_id, doc_id, manual_boxes=[*(doc.get("manual_boxes") or []), rect],
                                processed=time.time())
-    return public_doc(doc)
+    learned = None
+    try:                                           # teach the detector the label next to this box (no value kept)
+        learned = learn_from_manual_box(folder_id, doc, rect)
+    except Exception:                              # learning is best-effort and never blocks the redaction
+        learned = None
+    return {**public_doc(doc), "learned_rule": learned}
+
+
+def learn_from_manual_box(folder_id: str, doc: dict, rect: list[int]) -> dict | None:
+    """OCR the deskewed ORIGINAL page around the box (box masked white) to find its label, and the box itself only
+    to classify the value's shape; the value text is discarded right away. Stores a global learned rule."""
+    from server.image_preprocessing import load_bgr
+    from server.ocr_engine import ocr_image
+    from server.rule_learner import RuleStore, is_builtin_label, learn_from_box
+    from server.vault import Word
+    pages = STORE.page_paths(folder_id, doc, "original")
+    page_no, x, y, w, h = (int(v) for v in rect)
+    if not 1 <= page_no <= len(pages):
+        return None
+    img = load_bgr(str(pages[page_no - 1]))
+    H, W = img.shape[:2]
+    reach = max(3 * h, 120)
+    cx0, cy0 = max(0, x - max(6 * h, 500)), max(0, y - reach)
+    cx1, cy1 = min(W, x + w + h), min(H, y + h + h)
+    crop = img[cy0:cy1, cx0:cx1].copy()
+    crop[max(0, y - cy0):y - cy0 + h, max(0, x - cx0):x - cx0 + w] = 255       # the value is never OCR'd here
+    _, words = ocr_image(crop, page_no=page_no, deskew=False)
+    label_words = [Word(t.text, t.x + cx0, t.y + cy0, t.w, t.h, t.conf, page_no, t.line_key) for t in words]
+    box_img = img[max(0, y):y + h, max(0, x):x + w]
+    value_text = " ".join(t.text for t in ocr_image(box_img, page_no=page_no, deskew=False)[1]) if box_img.size else ""
+    rule = learn_from_box(label_words, (x, y, w, h), value_text, W, H)
+    del value_text                                 # (shape is already computed)
+    if rule is None or is_builtin_label(rule.label):
+        return None
+    return RuleStore.shared().add(rule).public()
 
 
 @api.delete("/folders/{folder_id}/documents/{doc_id}/manual-redact")
@@ -657,6 +692,9 @@ def put_calibration(folder_id: str, cal: Calibration) -> dict:
 def _queue_reapply(folder_id: str, doc: dict, cal: Calibration) -> dict | None:
     """Caller holds STORE.lock. Without a plan (e.g. scanned before plans existed) it falls back to a rescan."""
     has_plan = bool(doc.get("pipeline_doc_id")) and plan_path(folder_id, doc["pipeline_doc_id"]).is_file()
+    # toggling the deep / universal scan changes DETECTION, which a re-apply does not redo -> full rescan
+    if cal.deep_scan != bool((doc.get("calibration") or {}).get("deep_scan")):
+        has_plan = False
     fields = {"status": "QUEUED", "calibration": cal.model_dump(), "error": None,
               "pending_job": "reapply" if has_plan else "scan"}
     if not has_plan:
@@ -768,6 +806,36 @@ def redact_source(folder_id: str, doc_id: str) -> dict:
         doc = STORE.update_doc(folder_id, doc_id, status="QUEUED", role=None, pending_job="scan")
     JOBS.put((folder_id, doc_id))
     return public_doc(doc)
+
+
+@api.get("/learned-rules")
+def list_learned_rules() -> dict:
+    from server.rule_learner import RuleStore
+    return {"rules": [r.public() for r in RuleStore.shared().rules()]}
+
+
+@api.delete("/learned-rules/{rule_id}")
+def delete_learned_rule(rule_id: str) -> dict:
+    from server.rule_learner import RuleStore
+    if not re.fullmatch(r"r_[a-z]{8}", rule_id) or not RuleStore.shared().delete(rule_id):
+        raise HTTPException(404, "Unknown rule")
+    return {"ok": True}
+
+
+@api.delete("/learned-rules")
+def reset_learned_rules() -> dict:
+    from server.rule_learner import RuleStore
+    return {"removed": RuleStore.shared().clear()}
+
+
+def slm_available() -> bool:
+    from server.pii_detector import PIIDetector
+    return PIIDetector.slm_available(config.LOCAL_SLM_BASE_URL)
+
+
+@api.get("/slm-status")
+def slm_status() -> dict:
+    return {"available": slm_available(), "model": config.LOCAL_SLM_MODEL}
 
 
 @api.get("/folders/{folder_id}/documents/{doc_id}/image/{kind}")

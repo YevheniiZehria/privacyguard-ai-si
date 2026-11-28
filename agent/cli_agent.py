@@ -85,7 +85,7 @@ ALLOWED_KEYS = {
     "residual_pii_count", "error", "tool", "blur_strength", "blur_level", "mode", "leak_count",
     "uncovered_count", "suggested_blur_strength", "suggested_padding_px", "is_id_card", "is_valid_id",
     "detected_fields", "field_count", "mean_confidence", "filled_doc_id", "pdf_path", "fields_filled",
-    "unfilled_fields",
+    "unfilled_fields", "low_coverage", "PARTY",
 }
 # field-name lists must contain field NAMES only — a value smuggled into such a list is blocked
 FIELD_LIST_KEYS = {"detected_fields", "fields_filled", "unfilled_fields"}

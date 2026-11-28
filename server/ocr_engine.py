@@ -6,6 +6,7 @@ vault; they are never sent to the LLM.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -70,7 +71,61 @@ def ocr_image(bgr: np.ndarray, page_no: int = 1, langs: str | None = None, psm: 
         alt = _tesseract_words(pre.ocr_gray, page_no, pre.scale, langs, psm)
         if _avg(alt) * max(len(alt), 1) > _avg(words) * max(len(words), 1):
             words = alt
+    foreign = foreign_langs()
+    if foreign and foreign != langs and needs_foreign_pass(words):
+        second = _tesseract_words(pre.ocr_binary, page_no, pre.scale, foreign, psm)
+        words = merge_passes(words, second)
     return pre.base_bgr, words
+
+
+# ----------------------------------------------------------------------------- Cyrillic / foreign second pass
+# Cyrillic read with ron+eng comes back as Latin look-alikes in capitals: МАР'ЯНА -> "MAP'AHA", ІВАНІВНА -> "IBAHIBHA"
+LOOKALIKE_TOKEN = re.compile(r"^[ABEHKMOPCTXYI'’]{4,}$")
+FOREIGN_MRZ = re.compile(r"^(?:P|I|ID|A|C)[<A-Z]?(?!ROU)[A-Z]{3}[A-Z<]{5,}")
+_FOREIGN: str | None = None
+
+
+def foreign_langs() -> str:
+    """OCR_LANGS_FOREIGN restricted to installed traineddata (+ukr when available); '' if none is usable."""
+    global _FOREIGN
+    if _FOREIGN is None:
+        try:
+            have = set(pytesseract.get_languages(config=""))
+        except Exception:
+            have = set()
+        wanted = config.OCR_LANGS_FOREIGN.split("+") + ["ukr"]
+        langs = [l for l in dict.fromkeys(wanted) if l in have]
+        _FOREIGN = "+".join(langs) if any(l in ("rus", "ukr", "bul", "srp") for l in langs) else ""
+    return _FOREIGN
+
+
+def needs_foreign_pass(words: list[Word]) -> bool:
+    texts = [w.text.strip(",.;:|()[]") for w in words]
+    lookalikes = sum(1 for t in texts if LOOKALIKE_TOKEN.match(t))
+    mrz = any(FOREIGN_MRZ.match(t.replace(" ", "")) for t in texts if t.count("<") >= 2)
+    return lookalikes >= 2 or mrz
+
+
+def merge_passes(first: list[Word], second: list[Word]) -> list[Word]:
+    """Per OCR line of the second pass: keep it where it reads better than the first pass (or where the first
+    pass read nothing), otherwise keep the first pass. Words stay in base-image coordinates."""
+    groups: dict[tuple, list[Word]] = {}
+    for w in second:
+        groups.setdefault(w.line_key, []).append(w)
+    result = list(first)
+    for key, ws in groups.items():
+        x0, x1 = min(w.x for w in ws), max(w.x + w.w for w in ws)
+        y0, y1 = min(w.y for w in ws), max(w.y + w.h for w in ws)
+        overlap = [w for w in result if w.x < x1 and w.x + w.w > x0
+                   and min(w.y + w.h, y1) - max(w.y, y0) >= 0.5 * min(w.h, y1 - y0)]
+        new_conf = _avg(ws)
+        if overlap and new_conf <= _avg(overlap) + 5:
+            continue
+        drop = {id(w) for w in overlap}
+        result = [w for w in result if id(w) not in drop]
+        result += [Word(w.text, w.x, w.y, w.w, w.h, w.conf, w.page, (w.page, 1000 + key[1], key[2], key[3]))
+                   for w in ws]
+    return result
 
 
 def ocr_file(file_path: str, doc_id: str, work_dir: Path | None = None) -> OcrResult:

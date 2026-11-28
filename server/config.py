@@ -27,6 +27,12 @@ REDACTION_MIN_PADDING_PX = int(_env("REDACTION_MIN_PADDING_PX", "4"))
 FACE_MODEL_PATH = _env("FACE_MODEL_PATH", str(PROJECT_ROOT / "models" / "face_detection_yunet_2023mar.onnx"))
 FACE_SCORE_THRESHOLD = float(_env("FACE_SCORE_THRESHOLD", "0.6"))
 FACE_PADDING_RATIO = float(_env("FACE_PADDING_RATIO", "0.3"))       # 25-35% outward covers hair / ears / chin
+# Rules learned from manual blur boxes (labels + value shapes only, never values) — shared by all folders / MCP
+LEARNED_RULES_PATH = Path(_env("LEARNED_RULES_PATH", str(PROJECT_ROOT / "learned_rules.json")))
+# Photographed documents: flatten the page (4-corner perspective warp) before deskew / OCR
+DEWARP_ENABLED = _env("DEWARP_ENABLED", "true").lower() in ("1", "true", "yes")
+# Second OCR pass for Cyrillic / foreign documents (only when cues appear); "+ukr" is added if installed
+OCR_LANGS_FOREIGN = _env("OCR_LANGS_FOREIGN", "ron+eng+rus")
 OUTPUT_DIR = Path(_env("OUTPUT_DIR", str(PROJECT_ROOT / "output")))
 WORK_DIR = OUTPUT_DIR / "work"
 
