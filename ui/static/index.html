@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PrivacyGuard AI — terminal</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%23000'/><path d='M8 10l6 6-6 6' stroke='%23fff' stroke-width='3' fill='none'/><rect x='16' y='20' width='9' height='3' fill='%23fff'/></svg>">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<!-- ================= STEP 1 · LOGIN ================= -->
+<main id="viewLogin" class="view view-login hidden">
+  <form id="loginForm" class="login-box" autocomplete="on">
+    <div class="login-top mono dim">PRIVACYGUARD // TERMINAL v2</div>
+    <h1 class="mono login-title"><span id="loginType" data-text="> AUTHENTICATE_SESSION"></span><span class="cursor">_</span></h1>
+    <p class="desc">Local document redaction console. Nothing leaves this machine.</p>
+
+    <label class="field">
+      <span class="field-label mono">username</span>
+      <span class="field-row"><span class="mono dim">$</span>
+        <input id="loginUser" name="username" class="input mono" autocomplete="username" spellcheck="false" required></span>
+    </label>
+    <label class="field">
+      <span class="field-label mono">access passphrase</span>
+      <span class="field-row"><span class="mono dim">#</span>
+        <input id="loginPass" name="password" type="password" class="input mono" autocomplete="current-password" required></span>
+    </label>
+
+    <div id="loginError" class="login-error mono hidden"></div>
+    <button type="submit" class="btn btn-primary btn-block" data-scramble>[ ENTER ]</button>
+  </form>
+</main>
+
+<!-- ================= TOP BAR (hub + dashboard) ================= -->
+<header id="topbar" class="topbar hidden">
+  <a href="#/folders" class="logo mono">PRIVACYGUARD <span class="dim">//</span> TERMINAL<span class="cursor">_</span></a>
+  <div class="grow"></div>
+  <button id="rulesBtn" class="btn btn-ghost btn-sm" title="Labels learned from your manual blur boxes" data-scramble>[ LEARNED RULES (<span id="rulesCount">0</span>) ]</button>
+  <span id="whoami" class="mono dim small"></span>
+  <button id="logoutBtn" class="btn btn-ghost btn-sm" data-scramble>[ LOGOUT ]</button>
+</header>
+
+<!-- ================= STEP 2 · FOLDER HUB ================= -->
+<main id="viewHub" class="view view-hub hidden">
+  <section class="hub">
+    <div class="hub-head">
+      <div class="mono dim small">~/workspace</div>
+      <h1 class="mono h1"><span id="hubType" data-text="DOCUMENT SETS"></span><span class="cursor">_</span></h1>
+      <p class="desc">Each folder is a document set. Everything dropped into it is redacted automatically.</p>
+    </div>
+
+    <button id="createFolderBtn" class="btn btn-primary btn-lg" data-scramble>[ + CREATE FOLDER ]</button>
+    <form id="createFolderForm" class="create-form hidden" autocomplete="off">
+      <span class="mono dim">mkdir</span>
+      <input id="folderNameInput" class="input mono" maxlength="64" placeholder="Client_Set_01" spellcheck="false" required>
+      <button type="submit" class="btn btn-primary btn-sm">CREATE</button>
+      <button type="button" id="createFolderCancel" class="btn btn-ghost btn-sm">ESC</button>
+    </form>
+
+    <div class="list-label mono dim small"><span id="folderCount">0 folders</span></div>
+    <ul id="folderGrid" class="folder-grid"></ul>
+  </section>
+</main>
+
+<!-- ================= STEP 3 · FOLDER DASHBOARD ================= -->
+<main id="viewFolder" class="view view-folder hidden">
+  <section class="dash">
+    <div class="dash-head">
+      <div>
+        <a href="#/folders" class="crumb mono">← BACK TO FOLDERS</a>
+        <h1 class="mono h1"><span id="folderTitle" data-scramble-text></span><span class="cursor">_</span></h1>
+        <div id="folderMeta" class="mono dim small"></div>
+      </div>
+      <div class="dash-actions">
+        <button id="autofillBtn" type="button" class="btn btn-ghost" data-scramble>[ AUTO-FILL FROM ID ]</button>
+        <a id="downloadAll" class="btn btn-primary disabled" href="#" data-scramble>[ DOWNLOAD ALL (.ZIP) ]</a>
+      </div>
+    </div>
+
+    <label id="dropZone" class="drop">
+      <input id="fileInput" type="file" multiple accept=".pdf,.png,.jpg,.jpeg" hidden>
+      <div class="drop-inner">
+        <div class="drop-icon mono">[ ↓ ]</div>
+        <div class="mono drop-title" id="dropTitle">DROP FILES TO REDACT</div>
+        <div class="desc">PDF · PNG · JPG — or click to browse. Sensitive data is blurred automatically.</div>
+      </div>
+      <div class="laser"></div>
+    </label>
+
+    <section id="calibFolder" class="calib collapsed" aria-label="Blur calibration">
+      <button type="button" class="calib-toggle mono" data-act="toggle" aria-expanded="false">[ BLUR CALIBRATION <span class="calib-caret">▾</span> ]
+        <span class="calib-summary dim" data-v="summary"></span></button>
+      <div class="calib-body">
+        <div class="calib-ctl">
+          <label class="calib-field"><span class="calib-label mono">STRENGTH</span>
+            <input type="range" class="range" data-k="blur_level" min="1" max="10" step="1" value="7" aria-label="Blur strength 1 to 10">
+            <span class="calib-val mono" data-v="blur_level">HIGH · 7</span></label>
+          <label class="calib-field"><span class="calib-label mono">PADDING</span>
+            <input type="range" class="range" data-k="padding_px" min="0" max="24" step="1" value="4" aria-label="Box padding in pixels">
+            <span class="calib-val mono" data-v="padding_px">4 px</span></label>
+          <div class="calib-field"><span class="calib-label mono">MODE</span>
+            <div class="seg mono" data-k="mode" role="radiogroup">
+              <button type="button" data-mode="blur" class="active" role="radio">IRREVERSIBLE BLUR</button>
+              <button type="button" data-mode="black" role="radio">SOLID BLACK</button>
+            </div></div>
+        </div>
+        <div class="calib-deep">
+          <label class="check mono"><input type="checkbox" data-k="deep_scan"> DEEP / UNIVERSAL SCAN</label>
+          <span id="slmHint" class="dim small mono"></span>
+        </div>
+        <p class="desc calib-hint">Cell size, kernel and noise already adapt to font size, resolution and contrast; strength raises them further. Every level stays unreadable. New uploads inherit the saved default.</p>
+        <div class="calib-actions">
+          <button type="button" class="btn btn-ghost btn-sm" data-act="save" data-scramble>[ SAVE DEFAULT ]</button>
+          <button type="button" class="btn btn-primary btn-sm" data-act="apply-all" data-scramble>[ APPLY &amp; RE-VERIFY ALL ]</button>
+        </div>
+      </div>
+    </section>
+
+    <div class="table-wrap">
+      <table class="doc-table">
+        <thead class="mono">
+          <tr><th>FILE</th><th class="col-size">SIZE</th><th class="col-status">STATUS</th><th class="col-actions"></th></tr>
+        </thead>
+        <tbody id="docRows"></tbody>
+      </table>
+      <div id="docEmpty" class="doc-empty mono dim">// no documents yet</div>
+    </div>
+  </section>
+</main>
+
+<!-- ================= PREVIEW MODAL ================= -->
+<div id="preview" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="previewTitle">
+  <div class="modal-box">
+    <div class="modal-head">
+      <span id="previewTitle" class="mono truncate"></span>
+      <div class="grow"></div>
+      <div class="seg mono" id="previewSeg">
+        <button data-mode="original">ORIGINAL</button>
+        <button data-mode="blurred" class="active">BLURRED</button>
+        <button data-mode="split">SIDE-BY-SIDE</button>
+      </div>
+      <button id="manualBtn" class="btn btn-ghost btn-sm" title="Drag a rectangle over anything left readable — it is blurred immediately (B)">[ + MANUAL BLUR BOX ]</button>
+      <button id="manualUndo" class="btn btn-ghost btn-sm hidden" title="Remove all manual boxes (the document is processed again)">UNDO MANUAL</button>
+      <div class="zoom mono" title="Wheel to zoom · drag to pan · double-click to fit">
+        <button id="zoomOut" class="btn btn-ghost btn-sm" title="Zoom out (-)">−</button>
+        <span id="zoomVal" class="zoom-val">100%</span>
+        <button id="zoomIn" class="btn btn-ghost btn-sm" title="Zoom in (+)">+</button>
+        <button id="zoomFit" class="btn btn-ghost btn-sm" title="Fit to window (0)">FIT</button>
+        <button id="zoom100" class="btn btn-ghost btn-sm" title="Actual pixels (1)">1:1</button>
+      </div>
+      <div id="pager" class="pager mono hidden">
+        <button id="pagePrev" class="btn btn-ghost btn-sm">‹</button>
+        <span id="pageLabel">1/1</span>
+        <button id="pageNext" class="btn btn-ghost btn-sm">›</button>
+      </div>
+      <button id="previewClose" class="btn btn-ghost btn-sm" title="Close (Esc)">✕</button>
+    </div>
+    <section id="calibDoc" class="calib calib-strip hidden" aria-label="Document blur calibration">
+      <div class="calib-ctl">
+          <label class="calib-field"><span class="calib-label mono">STRENGTH</span>
+            <input type="range" class="range" data-k="blur_level" min="1" max="10" step="1" value="7" aria-label="Blur strength 1 to 10">
+            <span class="calib-val mono" data-v="blur_level">HIGH · 7</span></label>
+          <label class="calib-field"><span class="calib-label mono">PADDING</span>
+            <input type="range" class="range" data-k="padding_px" min="0" max="24" step="1" value="4" aria-label="Box padding in pixels">
+            <span class="calib-val mono" data-v="padding_px">4 px</span></label>
+          <div class="calib-field"><span class="calib-label mono">MODE</span>
+            <div class="seg mono" data-k="mode" role="radiogroup">
+              <button type="button" data-mode="blur" class="active" role="radio">IRREVERSIBLE BLUR</button>
+              <button type="button" data-mode="black" role="radio">SOLID BLACK</button>
+            </div></div>
+        </div>
+      <div class="calib-actions">
+        <label class="check mono dim"><input type="checkbox" data-k="save_as_default"> save as folder default</label>
+        <button type="button" class="btn btn-primary btn-sm" data-act="apply" data-scramble>[ APPLY &amp; RE-VERIFY ]</button>
+      </div>
+    </section>
+    <div id="previewBody" class="modal-body mode-blurred">
+      <figure class="pane pane-original"><figcaption class="mono">ORIGINAL</figcaption><img id="imgOriginal" alt="Original document" draggable="false"></figure>
+      <figure class="pane pane-blurred"><figcaption class="mono">BLURRED</figcaption><img id="imgBlurred" alt="Redacted document" draggable="false"></figure>
+    </div>
+  </div>
+</div>
+
+<!-- ================= AUTO-FILL MODAL ================= -->
+<div id="autofill" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="afTitle">
+  <form id="afForm" class="modal-box af-box" autocomplete="off">
+    <div class="modal-head">
+      <span id="afTitle" class="mono">&gt; AUTO-FILL FROM ID</span>
+      <div class="grow"></div>
+      <button type="button" class="btn btn-ghost btn-sm" data-af="close" title="Close (Esc)">✕</button>
+    </div>
+    <div class="af-body">
+      <p class="desc">The ID card's data is written onto the blank form locally. Values never leave this machine and are never stored in the folder's metadata — only which fields were filled.</p>
+      <label class="field">
+        <span class="field-label mono">1 · source id card (buletin)</span>
+        <span class="af-pick"><select id="afId" class="input mono" required></select>
+          <button type="button" class="btn btn-ghost btn-sm" data-af="upload-id">[ UPLOAD ]</button></span>
+      </label>
+      <label class="field">
+        <span class="field-label mono">2 · target blank form (formular gol)</span>
+        <span class="af-pick"><select id="afFormDoc" class="input mono" required></select>
+          <button type="button" class="btn btn-ghost btn-sm" data-af="upload-form">[ UPLOAD ]</button></span>
+      </label>
+      <div class="field-label mono af-sub">3 · optional — not on the id card</div>
+      <div class="af-grid">
+        <label class="field"><span class="field-label mono">telefon</span><input class="input mono" data-extra="phone" maxlength="40"></label>
+        <label class="field"><span class="field-label mono">e-mail</span><input class="input mono" data-extra="email" maxlength="120"></label>
+        <label class="field"><span class="field-label mono">data curentă</span><input class="input mono" data-extra="date" maxlength="20"></label>
+        <label class="field"><span class="field-label mono">scopul cererii</span><input class="input mono" data-extra="purpose" maxlength="200"></label>
+      </div>
+      <input id="afFile" type="file" accept=".pdf,.png,.jpg,.jpeg" hidden>
+    </div>
+    <div class="af-foot">
+      <button type="submit" class="btn btn-primary" data-scramble>[ FILL FORM ]</button>
+    </div>
+  </form>
+</div>
+
+<!-- ================= LEARNED RULES DRAWER ================= -->
+<aside id="rulesDrawer" class="drawer hidden" aria-label="Learned rules">
+  <div class="drawer-head">
+    <span class="mono">&gt; LEARNED RULES</span>
+    <div class="grow"></div>
+    <button id="rulesReset" class="btn btn-ghost btn-sm" title="Forget every learned rule">RESET ALL</button>
+    <button id="rulesClose" class="btn btn-ghost btn-sm" title="Close">✕</button>
+  </div>
+  <p class="desc drawer-note">Learned from your manual blur boxes: only the label next to the box, where the value sits and its shape — never the value itself. Applied to every folder and to the agent.</p>
+  <ul id="rulesList" class="rules-list mono"></ul>
+</aside>
+
+<div id="toast" class="toast mono hidden"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
